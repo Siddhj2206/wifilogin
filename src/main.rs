@@ -7,45 +7,63 @@ mod wifi;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::time::Duration;
+use portal::Portal as _;
+use serde::{Deserialize, Serialize};
+use session::{Controller, Snapshot, State};
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
+use wifi::Manager;
+
+/// How often the daemon retries establishing the D-Bus watch when in
+/// polling-fallback mode.
+const WATCH_RETRY: Duration = Duration::from_secs(30);
+/// Let NM settle after a wake event before acting on it.
+const EVENT_DEBOUNCE: Duration = Duration::from_millis(400);
 
 #[derive(Parser)]
 #[command(
     name = "wifilogin",
     version,
-    about = "Efficient auto-login for R-VIT captive portal — event-driven, only on target SSIDs"
+    about = "Event-driven captive-portal auto-login for NetworkManager (Linux)",
+    after_help = "Typical setup:\n  wifilogin config init\n  wifilogin creds set myuser\n  wifilogin status"
 )]
 struct Cli {
+    /// Config file location (default: $XDG_CONFIG_HOME/wifilogin/config.toml)
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon (default). Efficient: sleeps until D-Bus WiFi event or `verify_interval` while on target.
+    /// Run the daemon (default command). Event-driven; only acts on target SSIDs.
     Run,
-    /// Show current WiFi and target status
+    /// Show daemon, wifi, credentials and config status
     Status,
-    /// Check connectivity (204)
+    /// Check internet connectivity. Exit 0 = online, 1 = captive/offline, 2 = error.
     Online,
-    /// Force portal login now (uses keyring + config)
+    /// Perform a portal login right now, then check connectivity
     Login,
-    /// Ensure connection to a target (activates saved NM profile)
+    /// Activate the saved NetworkManager profile for a target SSID
     Ensure {
-        /// SSID to ensure (defaults to first target)
+        /// SSID to ensure (defaults to the first configured target)
         ssid: Option<String>,
     },
     /// Pause auto-login (daemon stays idle until resumed)
     Pause,
     /// Resume auto-login
     Resume,
-    /// Manage credentials in system keyring
+    /// Manage portal credentials in the system keyring
     Creds {
         #[command(subcommand)]
         op: CredsOp,
     },
-    /// Print or init config file
+    /// Manage the config file
     Config {
         #[command(subcommand)]
         op: ConfigOp,
@@ -54,25 +72,43 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CredsOp {
-    Set { username: String, password: String },
+    /// Store credentials. Password is prompted for securely unless --stdin is given.
+    Set {
+        /// Portal username (prompted if omitted)
+        username: Option<String>,
+        /// Read the password from stdin instead of an interactive prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Show whether credentials are stored (never prints the password)
     Get,
+    /// Delete stored credentials
     Delete,
 }
 
 #[derive(Subcommand)]
 enum ConfigOp {
+    /// Print the config file path
     Path,
+    /// Create a commented config file (refuses to overwrite)
     Init,
+    /// Print the current config
     Show,
+    /// Open the config in $EDITOR and validate it afterwards
+    Edit,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
+    if let Some(path) = cli.config {
+        config::set_config_override(path);
+    }
     let cmd = cli.cmd.unwrap_or(Command::Run);
 
     match cmd {
@@ -81,16 +117,10 @@ async fn main() -> Result<()> {
         Command::Online => cmd_online().await,
         Command::Login => cmd_login().await,
         Command::Ensure { ssid } => cmd_ensure(ssid).await,
-        Command::Pause => cmd_pause().await,
-        Command::Resume => cmd_resume().await,
+        Command::Pause => cmd_pause_resume(false).await,
+        Command::Resume => cmd_pause_resume(true).await,
         Command::Creds { op } => match op {
-            CredsOp::Set { username, password } => {
-                keyring::store(&username, &password).await?;
-                println!("credentials stored for {username}");
-                // Try to wake daemon right away (if running) so it retries immediately
-                try_wake_daemon();
-                Ok(())
-            }
+            CredsOp::Set { username, stdin } => cmd_creds_set(username, stdin).await,
             CredsOp::Get => {
                 match keyring::load().await {
                     Ok((u, _)) => println!("credentials present for {u}"),
@@ -102,6 +132,7 @@ async fn main() -> Result<()> {
             CredsOp::Delete => {
                 keyring::delete().await?;
                 println!("credentials deleted");
+                settings::wake_daemon();
                 Ok(())
             }
         },
@@ -111,12 +142,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigOp::Init => {
-                let cfg = config::load()?;
-                println!(
-                    "config at {} — targets={:?}",
-                    config::config_path()?.display(),
-                    cfg.targets
-                );
+                let path = config::init()?;
+                println!("created {}", path.display());
+                println!("edit it, then run `wifilogin creds set <username>`");
                 Ok(())
             }
             ConfigOp::Show => {
@@ -124,89 +152,121 @@ async fn main() -> Result<()> {
                 println!("{}", toml::to_string_pretty(&cfg)?);
                 Ok(())
             }
+            ConfigOp::Edit => cmd_config_edit().await,
         },
     }
 }
 
 async fn cmd_status() -> Result<()> {
-    let cfg = config::load()?;
-    let wifi = wifi::Manager::new().await?;
-    let cur = wifi.current_ssid().await?;
-    let settings = settings::Manager::new().unwrap_or_else(|_| {
-        // fallback to enabled if settings can't be loaded
-        settings::Manager::new().expect("settings fallback")
-    });
-    let enabled = settings.get().enabled;
-    println!("targets: {}", cfg.targets.join(", "));
-    println!("portal: {}", cfg.portal_url);
-    println!(
-        "enabled: {} ({} to toggle)",
-        enabled,
-        if enabled { "pause" } else { "resume" }
-    );
-    match cur {
-        None => println!("wifi: disconnected"),
-        Some(ssid) => {
-            let on = cfg.is_target(&ssid);
-            println!("wifi: {ssid} (on_target={on})");
-            if on {
-                let online = portal::online().await.unwrap_or(false);
-                println!("online: {online}");
+    // Daemon health first — that's the question people actually have.
+    match read_daemon_state()? {
+        None => println!("daemon: not running (`wifilogin run` to start)"),
+        Some(st) => {
+            let age = unix_now().saturating_sub(st.updated);
+            let age = humantime::format_duration(Duration::from_secs(age)).to_string();
+            if pid_alive(st.pid) {
+                println!("daemon: running (pid {}, last update {age} ago)", st.pid);
+            } else {
+                println!(
+                    "daemon: NOT running (stale state from pid {}, last update {age} ago)",
+                    st.pid
+                );
+            }
+            println!("daemon state: {} — {}", st.state, st.message);
+            if let Some(e) = &st.last_error {
+                println!("last error: {e}");
             }
         }
     }
+
+    // Live wifi state
+    let cfg = match config::load() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            println!("config: {e}");
+            None
+        }
+    };
+
+    let wifi = wifi::Manager::new().await.ok();
+    let ssid = match &wifi {
+        Some(w) => w.current_ssid().await.unwrap_or(None),
+        None => None,
+    };
+    match (&ssid, &cfg) {
+        (None, _) => println!("wifi: disconnected"),
+        (Some(s), Some(c)) => {
+            let on = c.is_target(s);
+            println!("wifi: {s} (target: {on})");
+            if on {
+                let online = portal::PortalClient
+                    .online(&c.connectivity_url)
+                    .await
+                    .unwrap_or(false);
+                println!("connectivity: {}", if online { "online" } else { "captive" });
+            }
+        }
+        (Some(s), None) => println!("wifi: {s}"),
+    }
+
     match keyring::load().await {
         Ok((u, _)) => println!("creds: present ({u})"),
-        Err(e) if keyring::is_not_found(&e) => println!("creds: missing"),
-        Err(e) => println!("creds: error {e}"),
+        Err(e) if keyring::is_not_found(&e) => println!("creds: missing (`wifilogin creds set`)"),
+        Err(e) => println!("creds: error: {e}"),
     }
-    println!("settings: {}", settings.path().display());
+
+    println!("config: {}", config::config_path()?.display());
+    println!("state:  {}", settings::settings_path()?.display());
     Ok(())
 }
 
-async fn cmd_pause() -> Result<()> {
+async fn cmd_pause_resume(enabled: bool) -> Result<()> {
     let mgr = settings::Manager::new()?;
-    mgr.set_enabled(false)?;
-    println!("paused — auto-login disabled");
-    println!("settings at {}", mgr.path().display());
-    try_wake_daemon();
-    Ok(())
-}
-
-async fn cmd_resume() -> Result<()> {
-    let mgr = settings::Manager::new()?;
-    mgr.set_enabled(true)?;
-    println!("resumed — auto-login enabled");
-    println!("settings at {}", mgr.path().display());
-    try_wake_daemon();
+    mgr.set_enabled(enabled)?;
+    let verb = if enabled { "resumed" } else { "paused" };
+    println!("{verb} — auto-login {}", if enabled { "enabled" } else { "disabled" });
+    settings::wake_daemon();
     Ok(())
 }
 
 async fn cmd_online() -> Result<()> {
-    let online = portal::online().await?;
-    if online {
-        println!("online");
-    } else {
-        println!("offline/captive");
+    let cfg = config::load()?;
+    match portal::PortalClient.online(&cfg.connectivity_url).await {
+        Ok(true) => {
+            println!("online");
+            std::process::exit(0);
+        }
+        Ok(false) => {
+            println!("captive/offline");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(2);
+        }
     }
-    Ok(())
 }
 
 async fn cmd_login() -> Result<()> {
     let cfg = config::load()?;
     let (u, p) = keyring::load()
         .await
-        .context("load credentials; run `wifilogin creds set <user> <pass>`")?;
-    let res = portal::login(&cfg.portal_url, &u, &p).await?;
-    println!(
-        "outcome={} http={} snippet={:?}",
-        res.outcome,
-        res.http_status,
-        &res.body_snippet[..res.body_snippet.len().min(200)]
-    );
-    let online = portal::online().await.unwrap_or(false);
-    println!("online={online}");
-    Ok(())
+        .context("no credentials — run `wifilogin creds set <username>`")?;
+    let client = portal::PortalClient;
+    println!("logging in to {} as {u}…", cfg.portal_url);
+    let res = client.login(&cfg.portal_url, &u, &p).await?;
+    println!("portal: {} (HTTP {})", res.outcome, res.http_status);
+    if res.outcome == portal::Outcome::BadCredentials {
+        std::process::exit(1);
+    }
+    let online = client.online(&cfg.connectivity_url).await.unwrap_or(false);
+    if online {
+        println!("connectivity: online");
+        Ok(())
+    } else {
+        println!("connectivity: still captive/offline");
+        std::process::exit(1);
+    }
 }
 
 async fn cmd_ensure(ssid: Option<String>) -> Result<()> {
@@ -224,77 +284,151 @@ async fn cmd_ensure(ssid: Option<String>) -> Result<()> {
     if r.already_connected {
         println!("already on {target}");
     } else {
-        println!("activating {target} ({})", r.connection_id);
+        println!("connected to {} ({})", target, r.connection_id);
     }
     Ok(())
 }
 
-fn try_wake_daemon() {
-    // Best-effort: try to send SIGHUP to running daemon so it retries immediately.
-    // Works for both manual `wifilogin run` and systemd user service.
-    let _ = std::process::Command::new("pkill")
-        .args(["-HUP", "-x", "wifilogin"])
-        .output();
-    // Also try systemd user kill (if under systemd)
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "kill", "-s", "HUP", "wifilogin.service"])
-        .output();
+async fn cmd_creds_set(username: Option<String>, stdin: bool) -> Result<()> {
+    let username = match username {
+        Some(u) => u,
+        None => {
+            print!("username: ");
+            std::io::stdout().flush()?;
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf)?;
+            buf.trim().to_string()
+        }
+    };
+
+    let password = if stdin {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        let p = buf.trim_end_matches(['\r', '\n']).to_string();
+        if p.is_empty() {
+            anyhow::bail!("empty password on stdin");
+        }
+        p
+    } else {
+        let p = rpassword::prompt_password("password: ")?;
+        let confirm = rpassword::prompt_password("confirm password: ")?;
+        if p != confirm {
+            anyhow::bail!("passwords do not match");
+        }
+        p
+    };
+
+    keyring::store(&username, &password).await?;
+    println!("credentials stored for {username}");
+    settings::wake_daemon();
+    Ok(())
+}
+
+async fn cmd_config_edit() -> Result<()> {
+    let path = config::config_path()?;
+    if !path.exists() {
+        config::init()?;
+    }
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(editor)
+        .arg(&path)
+        .status()
+        .context("failed to launch $EDITOR")?;
+    if !status.success() {
+        anyhow::bail!("editor exited with {status}");
+    }
+    // Validate what the user wrote.
+    config::load()?;
+    println!("config ok: {}", path.display());
+    settings::wake_daemon();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Daemon
+// ---------------------------------------------------------------------------
+
+type DaemonController = Controller<Manager, portal::PortalClient, keyring::KeyringCreds>;
+
+#[derive(Serialize, Deserialize)]
+struct DaemonState {
+    pid: u32,
+    state: String,
+    message: String,
+    ssid: Option<String>,
+    online: bool,
+    updated: u64,
+    last_error: Option<String>,
+    last_login: Option<String>,
 }
 
 async fn run_daemon() -> Result<()> {
-    let cfg = config::load()?;
-    cfg.validate()?;
+    let mut cfg = config::load_or_create()?;
     let settings_mgr = settings::Manager::new()?;
+    let wifi = Manager::new()
+        .await
+        .context("init wifi manager (is NetworkManager running and accessible?)")?;
+
+    let state_path = settings::daemon_state_path()?;
+    // Stale state from a previous run means nothing while we're alive.
+    let _ = std::fs::remove_file(&state_path);
+
     tracing::info!(
         targets = ?cfg.targets,
         portal = %cfg.portal_url,
         verify = ?cfg.verify_interval,
+        retry = ?cfg.retry_interval,
         enabled = settings_mgr.get().enabled,
-        settings = %settings_mgr.path().display(),
         "starting wifilogin daemon"
     );
 
-    let wifi = wifi::Manager::new().await.context("init wifi manager")?;
-    let controller = session::Controller::new(&cfg, &wifi, &settings_mgr);
+    let mut controller: DaemonController = Controller::new(
+        wifi.clone(),
+        portal::PortalClient,
+        keyring::KeyringCreds,
+        settings_mgr.clone(),
+        cfg.retry_interval,
+    );
 
-    // D-Bus event channel — None if no wifi device / watch fails, then we fallback to polling
-    let mut events: Option<tokio::sync::mpsc::Receiver<wifi::Event>> = match wifi.watch().await {
-        Ok(rx) => {
-            tracing::info!(
-                "watching NetworkManager D-Bus for SSID/State changes (event-driven, no polling)"
-            );
-            Some(rx)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "D-Bus watch failed — falling back to polling every verify_interval");
-            None
-        }
-    };
+    // D-Bus event channel — None if the watch fails, then we fall back to
+    // polling and periodically retry establishing the watch.
+    let mut events = try_watch(&wifi).await;
+    let mut next_watch_attempt = Instant::now() + WATCH_RETRY;
 
-    // Watch settings file for changes (pause/resume) — event-driven, not polling
-    let (settings_tx, mut settings_rx) = tokio::sync::mpsc::channel::<()>(4);
-    let settings_path = settings_mgr.path().clone();
-    let _watcher = spawn_settings_watcher(settings_path, settings_tx);
+    // Watch config, settings and wake files — reload + step on any change.
+    let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let watch_paths: Vec<PathBuf> = [
+        config::config_path().ok(),
+        settings::settings_path().ok(),
+        settings::wake_path().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let _fs_watcher = spawn_fs_watcher(watch_paths, fs_tx);
 
-    // Initial step immediately
-    let (snap, retry) = controller.step().await;
-    log_snapshot(&snap);
-    let mut next_retry = retry.map(|d| tokio::time::Instant::now() + d);
+    let mut prev_state: Option<State> = None;
 
-    // Signal handling
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // Signals
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let mut sigusr1 =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+
+    // Initial step
+    let mut next_retry = tick(&mut controller, &cfg, &state_path, &mut prev_state).await;
 
     loop {
-        // Build sleep future: None = sleep forever until event/signal
+        let has_events = events.is_some();
         let sleep_fut = async {
-            if let Some(deadline) = next_retry {
-                tokio::time::sleep_until(deadline).await;
-            } else {
-                std::future::pending::<()>().await;
+            let watch_deadline = (!has_events).then_some(next_watch_attempt);
+            let deadline = match (next_retry, watch_deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            match deadline {
+                Some(d) => tokio::time::sleep_until(d).await,
+                None => std::future::pending::<()>().await,
             }
         };
 
@@ -308,24 +442,16 @@ async fn run_daemon() -> Result<()> {
                 break;
             }
             _ = sighup.recv() => {
-                tracing::info!("SIGHUP — reload & retry (creds/settings changed)");
-                let _ = settings_mgr.reload();
-                let (snap, retry) = controller.step().await;
-                log_snapshot(&snap);
-                next_retry = retry.map(|d| tokio::time::Instant::now() + d);
+                tracing::info!("SIGHUP — reloading config & settings");
+                reload(&mut cfg, &settings_mgr);
+                next_retry = tick(&mut controller, &cfg, &state_path, &mut prev_state).await;
             }
-            _ = sigusr1.recv() => {
-                tracing::info!("SIGUSR1 — retry");
-                let (snap, retry) = controller.step().await;
-                log_snapshot(&snap);
-                next_retry = retry.map(|d| tokio::time::Instant::now() + d);
-            }
-            _ = settings_rx.recv() => {
-                tracing::info!("settings changed — reload & retry");
-                let _ = settings_mgr.reload();
-                let (snap, retry) = controller.step().await;
-                log_snapshot(&snap);
-                next_retry = retry.map(|d| tokio::time::Instant::now() + d);
+            _ = fs_rx.recv() => {
+                // Coalesce bursts of filesystem events into one reload.
+                while fs_rx.try_recv().is_ok() {}
+                tracing::info!("config/settings/wake file changed — reloading");
+                reload(&mut cfg, &settings_mgr);
+                next_retry = tick(&mut controller, &cfg, &state_path, &mut prev_state).await;
             }
             ev = async {
                 if let Some(rx) = events.as_mut() {
@@ -334,74 +460,206 @@ async fn run_daemon() -> Result<()> {
                     std::future::pending().await
                 }
             } => {
-                if let Some(ev) = ev {
-                    tracing::info!(?ev, "wifi event — waking");
-                    // Debounce: small delay to let NM settle after event
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                    let (snap, retry) = controller.step().await;
-                    log_snapshot(&snap);
-                    next_retry = retry.map(|d| tokio::time::Instant::now() + d);
-                } else {
-                    // Channel closed — NM gone, fallback to polling
-                    tracing::warn!("D-Bus watch channel closed — falling back to polling");
-                    events = None;
-                    next_retry = Some(tokio::time::Instant::now() + cfg.verify_interval);
+                match ev {
+                    Some(_) => {
+                        tokio::time::sleep(EVENT_DEBOUNCE).await;
+                        next_retry = tick(&mut controller, &cfg, &state_path, &mut prev_state).await;
+                    }
+                    None => {
+                        tracing::warn!("D-Bus watch channel closed — falling back to polling");
+                        events = None;
+                        next_watch_attempt = Instant::now() + WATCH_RETRY;
+                        next_retry = Some(Instant::now() + cfg.verify_interval);
+                    }
                 }
             }
             _ = sleep_fut => {
-                tracing::debug!("timer fired — re-checking");
-                let (snap, retry) = controller.step().await;
-                log_snapshot(&snap);
-                next_retry = retry.map(|d| tokio::time::Instant::now() + d);
+                let now = Instant::now();
+                if !has_events && now >= next_watch_attempt {
+                    next_watch_attempt = now + WATCH_RETRY;
+                    if let Some(rx) = try_watch(&wifi).await {
+                        tracing::info!("D-Bus watch re-established — event-driven again");
+                        events = Some(rx);
+                    }
+                }
+                next_retry = tick(&mut controller, &cfg, &state_path, &mut prev_state).await;
             }
         }
     }
 
+    let _ = std::fs::remove_file(&state_path);
     Ok(())
 }
 
-fn spawn_settings_watcher(
-    path: std::path::PathBuf,
-    tx: tokio::sync::mpsc::Sender<()>,
-) -> Option<notify::RecommendedWatcher> {
-    use notify::{EventKind, RecursiveMode, Watcher};
-    let parent = path.parent()?.to_path_buf();
-    let watch_path = path.clone();
-    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-        if let Ok(ev) = res {
-            // Only wake on modify/create for our settings file
-            let is_our_file = ev.paths.iter().any(|p| p == &watch_path);
-            if is_our_file
-                && matches!(
-                    ev.kind,
-                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                )
-            {
-                let _ = tx.blocking_send(());
-            }
+async fn try_watch(wifi: &Manager) -> Option<Receiver<wifi::Event>> {
+    match wifi.watch().await {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            tracing::warn!(error = %e, "D-Bus watch unavailable — polling fallback");
+            None
         }
-    })
-    .ok()?;
-    // Watch parent dir (file may not exist yet)
-    let _ = watcher.watch(&parent, RecursiveMode::NonRecursive);
-    // Ensure file exists so we get events
-    let _ = std::fs::create_dir_all(&parent);
-    Some(watcher)
+    }
 }
 
-fn log_snapshot(s: &session::Snapshot) {
+fn reload(cfg: &mut config::Config, settings_mgr: &settings::Manager) {
+    match config::load_or_create() {
+        Ok(c) => *cfg = c,
+        Err(e) => tracing::warn!(error = %e, "config reload failed — keeping previous config"),
+    }
+    if let Err(e) = settings_mgr.reload() {
+        tracing::warn!(error = %e, "settings reload failed");
+    }
+}
+
+async fn tick(
+    controller: &mut DaemonController,
+    cfg: &config::Config,
+    state_path: &std::path::Path,
+    prev_state: &mut Option<State>,
+) -> Option<Instant> {
+    let (snap, retry) = controller.step(cfg).await;
+    log_snapshot(&snap);
+    write_daemon_state(state_path, &snap);
+    maybe_notify(*prev_state, &snap);
+    *prev_state = Some(snap.state);
+    retry.map(|d| Instant::now() + d)
+}
+
+fn log_snapshot(s: &Snapshot) {
     tracing::info!(
         state = %s.state,
         msg = %s.message,
         ssid = ?s.current_ssid,
         on_target = s.on_target,
         online = s.online,
-        "tick"
+        "step"
     );
     if let Some(e) = &s.last_error {
         tracing::warn!(error = %e, "last error");
     }
     if let Some(l) = &s.last_login {
         tracing::info!(outcome = %l.outcome, http = l.http_status, "last login");
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(snippet = %l.body_snippet, "portal response snippet");
+        }
     }
+}
+
+fn write_daemon_state(path: &std::path::Path, s: &Snapshot) {
+    let st = DaemonState {
+        pid: std::process::id(),
+        state: s.state.to_string(),
+        message: s.message.clone(),
+        ssid: s.current_ssid.clone(),
+        online: s.online,
+        updated: unix_now(),
+        last_error: s.last_error.clone(),
+        last_login: s.last_login.as_ref().map(|l| l.outcome.to_string()),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(data) = serde_json::to_string(&st) {
+        let _ = std::fs::write(path, data);
+    }
+}
+
+fn read_daemon_state() -> Result<Option<DaemonState>> {
+    let path = settings::daemon_state_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    Ok(serde_json::from_str(&raw).ok())
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Desktop notification on state *transitions* only, so a persistent problem
+/// never spams. Silent if notify-send isn't installed.
+fn maybe_notify(prev: Option<State>, snap: &Snapshot) {
+    if prev == Some(snap.state) {
+        return;
+    }
+    match snap.state {
+        State::BadCredentials => notify_send(
+            "WiFi login failed",
+            "Invalid username or password — run `wifilogin creds set`",
+        ),
+        State::CredentialsMissing => notify_send(
+            "WiFi login not configured",
+            "Run `wifilogin creds set <username>` to store credentials",
+        ),
+        State::Captive => notify_send("WiFi portal login failed", &snap.message),
+        State::NeedsProvision => notify_send("wifilogin", &snap.message),
+        State::Online => {
+            let recovered = matches!(
+                prev,
+                Some(State::BadCredentials
+                    | State::CredentialsMissing
+                    | State::Captive
+                    | State::Error)
+            );
+            if recovered {
+                notify_send("WiFi online", "captive portal authenticated");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn notify_send(summary: &str, body: &str) {
+    tracing::info!(summary, body, "notification");
+    let _ = std::process::Command::new("notify-send")
+        .args(["-a", "wifilogin", summary, body])
+        .spawn();
+}
+
+fn spawn_fs_watcher(
+    paths: Vec<PathBuf>,
+    tx: tokio::sync::mpsc::Sender<()>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    if paths.is_empty() {
+        return None;
+    }
+    let watched = paths.clone();
+    let mut watcher = notify::recommended_watcher(
+        move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(ev) = res
+                && matches!(
+                    ev.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                )
+                && ev.paths.iter().any(|p| watched.iter().any(|w| w == p))
+            {
+                let _ = tx.blocking_send(());
+            }
+        },
+    )
+    .ok()?;
+
+    // Watch parent dirs so newly created files (config init, wake touch) are
+    // seen too.
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for p in paths {
+        if let Some(parent) = p.parent()
+            && !parents.contains(&parent.to_path_buf())
+        {
+            parents.push(parent.to_path_buf());
+        }
+    }
+    for parent in parents {
+        let _ = watcher.watch(&parent, RecursiveMode::NonRecursive);
+    }
+    Some(watcher)
 }

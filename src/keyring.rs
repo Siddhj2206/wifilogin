@@ -4,12 +4,26 @@ const SERVICE: &str = "wifilogin";
 const USER_KEY: &str = "username";
 const PASS_KEY: &str = "password";
 
-// Keep compat with old latch service so existing creds still work if wifilogin not found.
+// Keep compat with the old latch service so existing creds still work.
 const LEGACY_SERVICE: &str = "latch";
 
 #[derive(Debug, thiserror::Error)]
 #[error("credentials not found in keyring")]
 pub struct NotFound;
+
+/// Source of portal credentials. A seam so the session controller can be
+/// tested without touching the real keyring.
+pub trait Creds: Send + Sync {
+    async fn load(&self) -> Result<(String, String)>;
+}
+
+pub struct KeyringCreds;
+
+impl Creds for KeyringCreds {
+    async fn load(&self) -> Result<(String, String)> {
+        load().await
+    }
+}
 
 /// Run a blocking keyring operation off the tokio runtime.
 /// `secret-service` blocking API creates its own `zbus::blocking::Connection`
@@ -25,9 +39,6 @@ where
     if tokio::runtime::Handle::try_current().is_err() {
         return f();
     }
-    // Inside tokio: spawn_blocking to not block the async worker, then spawn a
-    // raw OS thread to escape the Handle so zbus::blocking can create its own runtime.
-
     tokio::task::spawn_blocking(move || {
         std::thread::spawn(f)
             .join()
@@ -58,7 +69,7 @@ pub async fn store(username: &str, password: &str) -> Result<()> {
 
 pub async fn load() -> Result<(String, String)> {
     on_keyring_thread(|| {
-        // Try new service first, then legacy.
+        // Try current service first, then legacy.
         if let Ok(v) = try_load(SERVICE) {
             return Ok(v);
         }

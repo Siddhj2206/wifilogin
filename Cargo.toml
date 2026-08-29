@@ -1,12 +1,12 @@
 [package]
 name = "wifilogin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Efficient auto-login for college captive portal — event-driven via NetworkManager D-Bus, only on target SSIDs"
+description = "Event-driven captive-portal auto-login for NetworkManager (Linux)"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 zbus = { version = "5", features = ["tokio"] }
 zvariant = "5"
 serde = { version = "1", features = ["derive"] }
@@ -22,11 +22,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 humantime = "2"
 notify = "6"
-serde_json = "1.0.151"
+serde_json = "1"
+rpassword = "7"
 
 [profile.release]
-opt-level = "z"  # Optimize for size ("s" is an alternative, test both)
-lto = true       # Enable Link-Time Optimization
+opt-level = "z"   # Optimize for size ("s" is an alternative, test both)
+lto = true        # Enable Link-Time Optimization
 codegen-units = 1 # Reduce parallel code generation units to increase optimization potential
-panic = "abort"  # Abort on panic to remove unwinding code
-strip = true     # Strip symbols from the binary (requires Rust 1.59+)
+panic = "abort"   # Abort on panic to remove unwinding code
+strip = true      # Strip symbols from the binary

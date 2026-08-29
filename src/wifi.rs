@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use std::collections::HashMap;
+use std::time::Duration;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MessageStream, Proxy};
 
@@ -9,11 +11,13 @@ const NM_IFACE: &str = "org.freedesktop.NetworkManager";
 const NM_DEVICE_IFACE: &str = "org.freedesktop.NetworkManager.Device";
 const NM_WIRELESS_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const NM_AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
+const NM_ACTIVE_CONN_IFACE: &str = "org.freedesktop.NetworkManager.Connection.Active";
 const NM_SETTINGS_PATH: &str = "/org/freedesktop/NetworkManager/Settings";
 const NM_SETTINGS_IFACE: &str = "org.freedesktop.NetworkManager.Settings";
 const NM_CONN_IFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
 const DBUS_PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const DEVICE_TYPE_WIFI: u32 = 2;
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 #[error("no WiFi device found")]
@@ -27,21 +31,36 @@ pub struct NeedsProvisioning(pub String);
 pub struct EnsureResult {
     pub already_connected: bool,
     pub connection_id: String,
-    #[allow(dead_code)]
-    pub ssid: String,
-    #[allow(dead_code)]
-    pub active_path: OwnedObjectPath,
+}
+
+/// Anything that can report the current SSID and activate a saved profile.
+/// A seam so the session controller can be tested without D-Bus.
+pub trait Wifi: Send + Sync {
+    async fn current_ssid(&self) -> Result<Option<String>>;
+    async fn ensure_connected(&self, target: &str) -> Result<EnsureResult>;
+}
+
+/// Wake-up event. The daemon doesn't care *what* changed — it re-reads state
+/// via `current_ssid()` on every step, which also handles device hotplug.
+#[derive(Debug, Clone)]
+pub enum Event {
+    Wake,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum Event {
-    SsidChanged { ssid: String, connected: bool },
-    DeviceStateChanged { state: u32 },
-}
-
 pub struct Manager {
     conn: Connection,
+}
+
+// Connection is Clone, so the manager is too — lets the daemon and controller
+// share one system bus connection.
+impl Wifi for Manager {
+    async fn current_ssid(&self) -> Result<Option<String>> {
+        self.current_ssid().await
+    }
+    async fn ensure_connected(&self, target: &str) -> Result<EnsureResult> {
+        self.ensure_connected(target).await
+    }
 }
 
 impl Manager {
@@ -52,7 +71,8 @@ impl Manager {
         Ok(Self { conn })
     }
 
-    /// Current SSID on the WiFi device, if any.
+    /// Current SSID on the WiFi device, if any. Re-resolves the device on
+    /// every call, so hotplugged/renamed devices are handled.
     pub async fn current_ssid(&self) -> Result<Option<String>> {
         let device = match self.wifi_device_path().await {
             Ok(p) => p,
@@ -61,7 +81,6 @@ impl Manager {
         };
 
         let proxy = Proxy::new(&self.conn, NM_SERVICE, device, NM_WIRELESS_IFACE).await?;
-
         let ap_path: OwnedObjectPath = proxy
             .get_property("ActiveAccessPoint")
             .await
@@ -77,19 +96,18 @@ impl Manager {
         if ssid_bytes.is_empty() {
             return Ok(None);
         }
-        let ssid = String::from_utf8_lossy(&ssid_bytes).to_string();
-        Ok(Some(ssid))
+        Ok(Some(String::from_utf8_lossy(&ssid_bytes).to_string()))
     }
 
+    /// Activate a saved NM profile for `target` and wait until it is actually
+    /// activated (ActivateConnection only starts activation).
     pub async fn ensure_connected(&self, target: &str) -> Result<EnsureResult> {
         if let Some(cur) = self.current_ssid().await?
             && cur == target
         {
             return Ok(EnsureResult {
                 already_connected: true,
-                connection_id: cur.clone(),
-                ssid: cur,
-                active_path: OwnedObjectPath::try_from("/").unwrap(),
+                connection_id: cur,
             });
         }
 
@@ -114,45 +132,58 @@ impl Manager {
                     || msg.contains("AccessDenied")
                     || msg.contains("Permission denied")
                 {
-                    anyhow::Error::from(NeedsProvisioning(target.to_string()))
+                    anyhow::Error::new(NeedsProvisioning(target.to_string()))
                 } else {
                     anyhow::anyhow!("ActivateConnection {}: {e}", conn_id)
                 }
             })?;
 
+        self.wait_activated(&active_path, target).await?;
+
         Ok(EnsureResult {
             already_connected: false,
             connection_id: conn_id,
-            ssid: target.to_string(),
-            active_path,
         })
     }
 
-    /// Event stream: D-Bus PropertiesChanged for ActiveAccessPoint + Device State.
-    /// Caller should `select!` on this; no polling timer needed.
+    async fn wait_activated(&self, active_path: &OwnedObjectPath, target: &str) -> Result<()> {
+        let proxy = Proxy::new(&self.conn, NM_SERVICE, active_path.clone(), NM_ACTIVE_CONN_IFACE)
+            .await?;
+        let deadline = tokio::time::Instant::now() + ACTIVATION_TIMEOUT;
+        loop {
+            let state: u32 = proxy.get_property("State").await.unwrap_or(0);
+            match state {
+                2 => return Ok(()), // NM_ACTIVE_CONNECTION_STATE_ACTIVATED
+                3 | 4 => {
+                    anyhow::bail!("activation of {target} failed or was deactivated");
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for {target} to activate");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Event stream: D-Bus PropertiesChanged for any NM device State or
+    /// ActiveAccessPoint change. Matches are not pinned to one device path so
+    /// suspend/resume and hotplug don't silently kill the watch.
     pub async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Event>> {
-        let device_path = self.wifi_device_path().await?;
-        let device_str = device_path.to_string();
-
-        // Add match rules. Using string form for compatibility across zbus versions.
-        // We watch both interfaces on the same device path.
-        let rule_wireless = format!(
-            "type='signal',sender='{}',interface='{}',member='PropertiesChanged',path='{}',arg0='{}'",
-            NM_SERVICE, DBUS_PROPS_IFACE, device_str, NM_WIRELESS_IFACE
-        );
-        let rule_device = format!(
-            "type='signal',sender='{}',interface='{}',member='PropertiesChanged',path='{}',arg0='{}'",
-            NM_SERVICE, DBUS_PROPS_IFACE, device_str, NM_DEVICE_IFACE
-        );
-
-        // zbus 5: add_match takes MatchRule — we use raw string via low-level call if needed.
-        // Fallback: use `call` AddMatch directly.
-        self.add_match_raw(&rule_wireless).await?;
-        self.add_match_raw(&rule_device).await?;
+        let rules = [
+            format!(
+                "type='signal',sender='{NM_SERVICE}',interface='{DBUS_PROPS_IFACE}',member='PropertiesChanged',arg0='{NM_DEVICE_IFACE}'"
+            ),
+            format!(
+                "type='signal',sender='{NM_SERVICE}',interface='{DBUS_PROPS_IFACE}',member='PropertiesChanged',arg0='{NM_WIRELESS_IFACE}'"
+            ),
+        ];
+        for rule in &rules {
+            self.add_match_raw(rule).await?;
+        }
 
         let mut stream = MessageStream::from(self.conn.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let conn = self.conn.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         tokio::spawn(async move {
             while let Some(msg) = stream.next().await {
@@ -168,90 +199,22 @@ impl Manager {
                 {
                     continue;
                 }
-                // path filter
-                if header
-                    .path()
-                    .map(|p| p.as_str() != device_str)
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
+                // Body: (interface, a{sv} changed, as invalidated)
                 let body = msg.body();
-                // Body: (s, a{sv}, as)
                 let Ok((iface, changed, _invalidated)): Result<
-                    (
-                        String,
-                        std::collections::HashMap<String, Value<'_>>,
-                        Vec<String>,
-                    ),
+                    (String, HashMap<String, Value<'_>>, Vec<String>),
                     _,
-                > = body.deserialize() else {
+                > = body.deserialize()
+                else {
                     continue;
                 };
-
-                match iface.as_str() {
-                    NM_WIRELESS_IFACE => {
-                        if let Some(v) = changed.get("ActiveAccessPoint") {
-                            let ap_str: String = match v {
-                                Value::ObjectPath(p) => p.to_string(),
-                                _ => {
-                                    // try decode as OwnedObjectPath via OwnedValue
-                                    if let Ok(ov) = OwnedValue::try_from(v.clone()) {
-                                        if let Ok(p) = OwnedObjectPath::try_from(ov) {
-                                            p.to_string()
-                                        } else {
-                                            v.to_string().trim_matches('"').to_string()
-                                        }
-                                    } else {
-                                        v.to_string().trim_matches('"').to_string()
-                                    }
-                                }
-                            };
-                            if ap_str == "/" || ap_str.is_empty() {
-                                let _ = tx
-                                    .send(Event::SsidChanged {
-                                        ssid: String::new(),
-                                        connected: false,
-                                    })
-                                    .await;
-                            } else {
-                                match ssid_by_ap(&conn, &ap_str).await {
-                                    Ok(ssid) => {
-                                        let _ = tx
-                                            .send(Event::SsidChanged {
-                                                ssid,
-                                                connected: true,
-                                            })
-                                            .await;
-                                    }
-                                    Err(_) => {
-                                        let _ = tx
-                                            .send(Event::SsidChanged {
-                                                ssid: String::new(),
-                                                connected: true,
-                                            })
-                                            .await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    NM_DEVICE_IFACE => {
-                        if let Some(v) = changed.get("State") {
-                            // try u32 decode via multiple paths
-                            let state_opt: Option<u32> = u32::try_from(v.clone()).ok().or({
-                                if let Value::U32(u) = v {
-                                    Some(*u)
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(state) = state_opt {
-                                let _ = tx.send(Event::DeviceStateChanged { state }).await;
-                            }
-                        }
-                    }
-                    _ => {}
+                let relevant = match iface.as_str() {
+                    NM_DEVICE_IFACE => changed.contains_key("State"),
+                    NM_WIRELESS_IFACE => changed.contains_key("ActiveAccessPoint"),
+                    _ => false,
+                };
+                if relevant && tx.send(Event::Wake).await.is_err() {
+                    break; // receiver dropped — daemon is shutting down
                 }
             }
         });
@@ -260,7 +223,6 @@ impl Manager {
     }
 
     async fn add_match_raw(&self, rule: &str) -> Result<()> {
-        // Use low-level dbus call org.freedesktop.DBus.AddMatch
         let proxy = Proxy::new(
             &self.conn,
             "org.freedesktop.DBus",
@@ -301,21 +263,16 @@ impl Manager {
 
         for path in conns {
             let cproxy = Proxy::new(&self.conn, NM_SERVICE, path.clone(), NM_CONN_IFACE).await?;
-            let settings: std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, OwnedValue>,
-            > = match cproxy.call("GetSettings", &()).await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let settings: HashMap<String, HashMap<String, OwnedValue>> =
+                match cproxy.call("GetSettings", &()).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
             let Some(wsec) = settings.get("802-11-wireless") else {
                 continue;
             };
             let Some(v) = wsec.get("ssid") else { continue };
-            let ssid_bytes: Vec<u8> = match Vec::<u8>::try_from(v.clone()) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
+            let Ok(ssid_bytes) = Vec::<u8>::try_from(v.clone()) else { continue };
             let ssid = String::from_utf8_lossy(&ssid_bytes).to_string();
             if ssid != target {
                 continue;
@@ -329,12 +286,6 @@ impl Manager {
         }
         Ok(None)
     }
-}
-
-async fn ssid_by_ap(conn: &Connection, ap_path: &str) -> Result<String> {
-    let proxy = Proxy::new(conn, NM_SERVICE, ap_path, NM_AP_IFACE).await?;
-    let bytes: Vec<u8> = proxy.get_property("Ssid").await.context("read Ssid")?;
-    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 pub fn is_provisioning(err: &anyhow::Error) -> bool {

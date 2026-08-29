@@ -1,23 +1,25 @@
 [Unit]
-Description=Efficient auto-login for R-VIT captive portal (wifilogin)
-After=network.target NetworkManager.service
-Wants=NetworkManager.service
+Description=Event-driven captive portal auto-login (wifilogin)
+# Runs as a user service. The daemon handles network readiness itself:
+# it only acts when a target SSID is connected, so no network.target
+# ordering is needed (and user units can't order against system targets).
 
 [Service]
 Type=simple
 # Binary installed via `cargo install --path .` or `cargo build --release` + copy
 ExecStart=%h/.cargo/bin/wifilogin run
-# Or if installed system-wide: /usr/local/bin/wifilogin run
 Restart=on-failure
 RestartSec=5
-# Only need D-Bus system bus access; no extra privileges
 Environment=RUST_LOG=info
 
-# Hardening (uncomment if running as system user)
-# NoNewPrivileges=true
-# PrivateTmp=true
-# ProtectSystem=strict
-# ProtectHome=read-only
+# Keyring access (secret service / gnome-keyring) requires an unlocked
+# session keyring. This normally works because the service runs in the user
+# session. If credentials fail only under systemd, ensure gnome-keyring's
+# PAM unlock is enabled on your distro.
+
+# Sandbox hardening
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=default.target
