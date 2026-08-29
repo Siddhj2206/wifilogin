@@ -15,24 +15,31 @@ On any other network, or while disconnected, it does nothing at all.
 ## Setup
 
 ```sh
-cargo install --path .
+# Install (or from a local checkout: cargo install --path .)
+cargo install --git https://example.com/you/wifilogin
 
 wifilogin config init        # writes a commented config, tells you where
 $EDITOR $(wifilogin config path)
 wifilogin creds set myuser   # prompts for the password (hidden, confirmed)
+wifilogin service install    # unit file, enable --now, done
 wifilogin status             # sanity check
 ```
 
-Run it as a systemd user service (recommended):
+`service install` embeds the systemd unit in the binary and writes it with the
+**actual path of the installed executable** — nothing is copied from the repo,
+so it works identically for `--git` and `--path` installs. Re-run it after
+upgrades or moving the binary; it's idempotent.
+
+Service management:
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp systemd/wifilogin.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now wifilogin
+wifilogin service install    # write unit + daemon-reload + enable --now
+wifilogin service status     # systemctl --user status (passthrough)
+wifilogin service start|stop|restart
+wifilogin service uninstall  # remove the unit; config + credentials are kept
 ```
 
-Or just run `wifilogin` (equivalent to `wifilogin run`).
+Run without systemd via plain `wifilogin run` (or just `wifilogin`).
 
 > **Keyring note:** credentials live in the secret service (gnome-keyring/KWallet).
 > Under systemd this needs an unlocked session keyring — standard on desktop
@@ -51,6 +58,7 @@ Or just run `wifilogin` (equivalent to `wifilogin run`).
 | `wifilogin creds set [user]` | Store credentials (password prompted, or `--stdin`) |
 | `wifilogin creds get` / `delete` | Check / remove stored credentials |
 | `wifilogin config init` / `show` / `path` / `edit` | Manage the config file |
+| `wifilogin service install` / `status` / `start` / `stop` / `restart` / `uninstall` | Manage the systemd user service |
 
 `config edit` opens `$EDITOR` and validates the file afterwards.
 

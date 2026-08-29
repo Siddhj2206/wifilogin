@@ -1,6 +1,7 @@
 mod config;
 mod keyring;
 mod portal;
+mod service;
 mod session;
 mod settings;
 mod wifi;
@@ -68,6 +69,11 @@ enum Command {
         #[command(subcommand)]
         op: ConfigOp,
     },
+    /// Manage the systemd user service (install, start, stop, …)
+    Service {
+        #[command(subcommand)]
+        op: ServiceOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -98,8 +104,31 @@ enum ConfigOp {
     Edit,
 }
 
+#[derive(Subcommand)]
+enum ServiceOp {
+    /// Install the user unit and enable + start it (idempotent; re-run after upgrades)
+    Install,
+    /// Stop, disable, and remove the unit (credentials and config are kept)
+    Uninstall,
+    /// Start the service
+    Start,
+    /// Stop the service
+    Stop,
+    /// Restart the service (e.g. after changing config that needs a fresh start)
+    Restart,
+    /// Show the systemd unit status
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Die silently on SIGPIPE (e.g. `wifilogin status | head`) instead of
+    // panicking when the pipe closes — standard unix tool behavior.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_writer(std::io::stderr)
@@ -153,6 +182,14 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             ConfigOp::Edit => cmd_config_edit().await,
+        },
+        Command::Service { op } => match op {
+            ServiceOp::Install => service::install(),
+            ServiceOp::Uninstall => service::uninstall(),
+            ServiceOp::Start => service::start(),
+            ServiceOp::Stop => service::stop(),
+            ServiceOp::Restart => service::restart(),
+            ServiceOp::Status => service::status(),
         },
     }
 }

@@ -2661,6 +2661,7 @@ dependencies = [
  "futures-util",
  "humantime",
  "keyring",
+ "libc",
  "notify",
  "reqwest",
  "rpassword",
