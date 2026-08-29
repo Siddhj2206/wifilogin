@@ -1,0 +1,23 @@
+[Unit]
+Description=Efficient auto-login for R-VIT captive portal (wifilogin)
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+# Binary installed via `cargo install --path .` or `cargo build --release` + copy
+ExecStart=%h/.cargo/bin/wifilogin run
+# Or if installed system-wide: /usr/local/bin/wifilogin run
+Restart=on-failure
+RestartSec=5
+# Only need D-Bus system bus access; no extra privileges
+Environment=RUST_LOG=info
+
+# Hardening (uncomment if running as system user)
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=strict
+# ProtectHome=read-only
+
+[Install]
+WantedBy=default.target
