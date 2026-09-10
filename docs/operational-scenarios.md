@@ -26,7 +26,7 @@ automatic credential submission
     = configured target SSID
     + active connection
     + an IPv4 or IPv6 default route
-    + NetworkManager reports Portal
+    + NetworkManager reports Portal or Limited
     + readable credentials
 ```
 
@@ -54,7 +54,8 @@ portal form submission.
 | Target owns only the IPv6 default route | `Default6` is accepted, so it can qualify just like an IPv4 default route. | Safe |
 | NetworkManager reports `Full` | `Online`; no HTTP connectivity probe is made. | Safe |
 | NetworkManager reports `Portal` | Credentials are submitted using the configured Pronto form, then one HTTP 204 postcondition check runs. | Expected operation |
-| NetworkManager reports `Unknown`, `None`, or `Limited` | `WaitingForNetworkManager`; it does not guess that a portal exists. | Safe, manual action may be needed |
+| NetworkManager reports `Limited` | Credentials are submitted using the configured Pronto form, then one HTTP 204 postcondition check runs. VIT can report this after a reconnect despite requiring portal login. | Expected operation |
+| NetworkManager reports `Unknown` or `None` | `WaitingForNetworkManager`; it does not guess that a portal exists. | Safe, manual action may be needed |
 | Connectivity checks disabled in NetworkManager | State stays `Unknown`; automatic login is intentionally disabled. | Deliberate limitation |
 | Username or password absent | `CredentialsMissing`; no timer retries and no password prompt occurs in the daemon. Re-run `setup` to correct it. | Safe |
 | Credentials definitively rejected | `BadCredentials`; no automatic retry prevents account lockouts. | Safe |

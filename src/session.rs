@@ -199,10 +199,14 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                     None,
                 )
             }
+            // NetworkManager does not consistently classify VIT's captive
+            // portal as `Portal`; after a reconnect it can report `Limited`.
+            // The target, activation, and default-route checks above still
+            // ensure credentials are submitted only to the intended Wi-Fi.
             PortalPermission::Allowed {
                 ssid,
                 connection_uuid,
-                connectivity: Connectivity::Portal,
+                connectivity: Connectivity::Portal | Connectivity::Limited,
                 ..
             } => self.login(config, ssid.into(), connection_uuid).await,
             PortalPermission::Allowed {
@@ -504,6 +508,25 @@ mod tests {
         );
         let (snapshot, _) = controller.step(&config()).await;
         assert_eq!(snapshot.state, State::Online);
+        assert_eq!(login_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn logs_in_when_networkmanager_reports_limited_connectivity() {
+        let (mut controller, login_count) = controller(
+            Ok(network(
+                "Campus",
+                "2f1c5a60-6e1f-4c42-b2a8-0d1a9d2f3e40",
+                true,
+                true,
+                Connectivity::Limited,
+            )),
+            true,
+            Outcome::Granted,
+        );
+        let (snapshot, retry) = controller.step(&config()).await;
+        assert_eq!(snapshot.state, State::Online);
+        assert_eq!(retry, None);
         assert_eq!(login_count.load(Ordering::SeqCst), 1);
     }
 

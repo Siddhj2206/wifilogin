@@ -11,7 +11,7 @@ The daemon will submit credentials only when all of these conditions are true:
 
 1. Wi-Fi is already associated with a configured target SSID.
 2. That Wi-Fi connection is NetworkManager's default route.
-3. NetworkManager reports its connectivity as `Portal`.
+3. NetworkManager reports its connectivity as `Portal` or `Limited`.
 4. A username is configured and the password is in the system keyring.
 
 This means a phone hotspot, an unlisted coffee-shop network, Ethernet, or a VPN
@@ -74,8 +74,7 @@ socket runs in the background.
 ## Requirements
 
 - Linux with NetworkManager on the system D-Bus
-- NetworkManager connectivity checking enabled; if it reports `Unknown` or
-  `Limited`, wifilogin deliberately waits rather than guessing that a portal is
-  present
+- NetworkManager connectivity checking enabled; if it reports `Unknown`, it
+  cannot safely determine whether to submit credentials
 - A user session keyring supported by the `keyring` crate
 - Optional: systemd user services for automatic background login
