@@ -5,7 +5,7 @@
 //! the *currently running* executable, so the service always points at
 //! whatever binary ran `service install`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -14,7 +14,7 @@ const UNIT_TEMPLATE: &str = include_str!("../systemd/wifilogin.service.in");
 
 /// Where the rendered unit lives for the current user.
 pub fn unit_path() -> Result<PathBuf> {
-    let dir = dirs::config_dir().context("could not resolve config dir")?;
+    let dir = crate::config::user_config_dir()?;
     Ok(dir.join("systemd/user").join(UNIT_NAME))
 }
 
@@ -83,8 +83,7 @@ pub fn install() -> Result<()> {
 
     let path = unit_path()?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
 
     let contents = render_unit(&exe, &extra_env);

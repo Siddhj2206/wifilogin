@@ -4,12 +4,16 @@ const SERVICE: &str = "wifilogin";
 const USER_KEY: &str = "username";
 const PASS_KEY: &str = "password";
 
-// Keep compat with the old latch service so existing creds still work.
-const LEGACY_SERVICE: &str = "latch";
-
-#[derive(Debug, thiserror::Error)]
-#[error("credentials not found in keyring")]
+#[derive(Debug)]
 pub struct NotFound;
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "credentials not found in keyring")
+    }
+}
+
+impl std::error::Error for NotFound {}
 
 /// Source of portal credentials. A seam so the session controller can be
 /// tested without touching the real keyring.
@@ -68,17 +72,7 @@ pub async fn store(username: &str, password: &str) -> Result<()> {
 }
 
 pub async fn load() -> Result<(String, String)> {
-    on_keyring_thread(|| {
-        // Try current service first, then legacy.
-        if let Ok(v) = try_load(SERVICE) {
-            return Ok(v);
-        }
-        if let Ok(v) = try_load(LEGACY_SERVICE) {
-            return Ok(v);
-        }
-        Err(NotFound.into())
-    })
-    .await
+    on_keyring_thread(|| try_load(SERVICE)).await
 }
 
 fn try_load(service: &str) -> Result<(String, String)> {
@@ -98,21 +92,18 @@ fn map_not_found(e: keyring::Error) -> anyhow::Error {
 
 pub async fn delete() -> Result<()> {
     on_keyring_thread(|| {
-        for svc in [SERVICE, LEGACY_SERVICE] {
-            let _ = keyring::Entry::new(svc, USER_KEY).and_then(|e| match e.delete_credential() {
-                Ok(()) => Ok(()),
-                Err(keyring::Error::NoEntry) => Ok(()),
-                Err(other) => Err(other),
-            });
-            let _ = keyring::Entry::new(svc, PASS_KEY).and_then(|e| match e.delete_credential() {
-                Ok(()) => Ok(()),
-                Err(keyring::Error::NoEntry) => Ok(()),
-                Err(other) => Err(other),
-            });
-        }
+        delete_entry(USER_KEY)?;
+        delete_entry(PASS_KEY)?;
         Ok(())
     })
     .await
+}
+
+fn delete_entry(key: &str) -> Result<()> {
+    match keyring::Entry::new(SERVICE, key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn is_not_found(err: &anyhow::Error) -> bool {

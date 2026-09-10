@@ -1,75 +1,83 @@
+use crate::paths;
+use crate::wifi::{Connectivity, NetworkState};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
 
-/// `--config` CLI override, set once at startup before any threads matter.
+/// `--config` CLI override, set once at startup before any tasks matter.
 static CONFIG_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_config_override(path: PathBuf) -> bool {
     CONFIG_OVERRIDE.set(path).is_ok()
 }
 
+/// One trusted NetworkManager connection on which credentials may be submitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    /// Displayed Wi-Fi name. It prevents surprising behavior in status output.
+    pub ssid: String,
+    /// NetworkManager connection UUID. Unlike an SSID, this is tied to the
+    /// local profile the user explicitly created and selected.
+    pub connection_uuid: String,
+}
+
+impl Target {
+    pub fn matches(&self, ssid: &str, connection_uuid: &str) -> bool {
+        self.ssid == ssid && self.connection_uuid.eq_ignore_ascii_case(connection_uuid)
+    }
+}
+
+/// Why the active Wi-Fi connection may or may not receive portal credentials.
+/// Both automatic and explicit login use this same classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalPermission<'a> {
+    Disconnected,
+    OtherNetwork(&'a str),
+    Connecting(&'a str),
+    TargetNotDefault(&'a str),
+    Allowed {
+        ssid: &'a str,
+        connection_uuid: &'a str,
+        connectivity: Connectivity,
+    },
+}
+
+/// The networks on which wifilogin is allowed to submit portal credentials.
+///
+/// This is an allow-list, not a list of networks to join. The daemon never
+/// activates a NetworkManager connection; joining a network is always left to
+/// NetworkManager and the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    /// SSIDs that trigger auto-login. Only these are acted on — everything else is ignored.
-    pub targets: Vec<String>,
+    /// Explicit local NetworkManager connections on which login is permitted.
+    #[serde(default)]
+    pub targets: Vec<Target>,
     /// Captive portal login endpoint.
     pub portal_url: String,
-    /// URL that must answer HTTP 204 when truly online. A captive portal
-    /// intercepts it, so a non-204 means we need to log in.
+    /// URL that must answer HTTP 204 after a login. It is used only to verify
+    /// an attempted login; NetworkManager's D-Bus Connectivity property drives
+    /// normal daemon decisions.
     #[serde(default = "default_connectivity_url")]
     pub connectivity_url: String,
-    /// How often to re-verify connectivity while connected to a target and online.
-    /// No polling happens when on other networks or disconnected — purely event-driven.
-    #[serde(default = "default_verify_interval", with = "humantime_serde")]
-    pub verify_interval: Duration,
-    /// Base delay between portal retries after a failure. Grows exponentially
-    /// (base, 2x, 4x, ...) up to a hard cap — never a fixed hammering interval.
-    #[serde(default = "default_retry_interval", with = "humantime_serde")]
-    pub retry_interval: Duration,
 }
 
 fn default_connectivity_url() -> String {
     "http://clients3.google.com/generate_204".to_string()
 }
-fn default_verify_interval() -> Duration {
-    Duration::from_secs(60)
-}
-fn default_retry_interval() -> Duration {
-    Duration::from_secs(10)
-}
-
-mod humantime_serde {
-    use serde::{Deserialize, Deserializer, Serializer, de};
-    use std::time::Duration;
-
-    pub fn deserialize<'de, D>(d: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(d)?;
-        humantime::parse_duration(&s).map_err(de::Error::custom)
-    }
-    pub fn serialize<S>(dur: &Duration, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        s.serialize_str(&humantime::format_duration(*dur).to_string())
-    }
-}
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            targets: vec!["R-VIT".to_string()],
+            // An empty allow-list is safe: a new installation cannot join or
+            // authenticate to any network until its owner opts in.
+            targets: Vec::new(),
             portal_url: "http://phc.prontonetworks.com/cgi-bin/authlogin?URI=".to_string(),
             connectivity_url: default_connectivity_url(),
-            verify_interval: default_verify_interval(),
-            retry_interval: default_retry_interval(),
         }
     }
 }
@@ -77,34 +85,38 @@ impl Default for Config {
 /// Commented template written by `wifilogin config init`.
 pub const TEMPLATE: &str = r#"# wifilogin configuration
 
-# SSIDs that trigger captive-portal auto-login. The daemon only ever
-# connects, logs in, or polls while on one of these.
-targets = ["R-VIT", "R-VIT-5G"]
+# Local NetworkManager connections where wifilogin may submit credentials.
+# This is deliberately empty by default. The daemon NEVER joins WiFi or
+# changes NetworkManager's autoconnect behavior; it only acts after you or
+# NetworkManager have connected to a listed local profile.
+#
+# Replace `targets = []` with one block per intended connection. Obtain its
+# UUID with: nmcli -g UUID connection show "Campus WiFi"
+#
+# [[targets]]
+# ssid = "Campus WiFi"
+# connection_uuid = "00000000-0000-0000-0000-000000000000"
+targets = []
 
 # Captive portal login endpoint (Pronto Networks default shown).
 portal_url = "http://phc.prontonetworks.com/cgi-bin/authlogin?URI="
 
-# URL that must return HTTP 204 when truly online. A captive portal
-# intercepts it, which is how the daemon detects it needs to log in.
+# Used once to verify an attempted login. Normal decisions come from
+# NetworkManager's D-Bus Connectivity state, not periodic HTTP polling.
 connectivity_url = "http://clients3.google.com/generate_204"
-
-# How often to re-verify connectivity while online on a target.
-verify_interval = "60s"
-
-# Base delay between portal retries after a failure. Grows exponentially
-# (10s, 20s, 40s, ...) up to a 5-minute cap, so a broken portal is never
-# hammered.
-retry_interval = "10s"
 "#;
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        if self.targets.is_empty() {
-            anyhow::bail!("targets must contain at least one SSID");
-        }
-        for t in &self.targets {
-            if t.trim().is_empty() {
-                anyhow::bail!("target SSID must not be empty");
+        for (index, target) in self.targets.iter().enumerate() {
+            if target.ssid.trim().is_empty() {
+                anyhow::bail!("targets[{index}].ssid must not be empty");
+            }
+            if !is_uuid(&target.connection_uuid) {
+                anyhow::bail!(
+                    "targets[{index}] ({}) has an invalid connection_uuid; expected a UUID",
+                    target.ssid
+                );
             }
         }
         if self.portal_url.trim().is_empty() {
@@ -113,37 +125,86 @@ impl Config {
         if self.connectivity_url.trim().is_empty() {
             anyhow::bail!("connectivity_url is required");
         }
-        if self.verify_interval.is_zero() {
-            anyhow::bail!("verify_interval must be > 0");
-        }
-        if self.retry_interval.is_zero() {
-            anyhow::bail!("retry_interval must be > 0");
-        }
+        validate_http_url("portal_url", &self.portal_url)?;
+        validate_http_url("connectivity_url", &self.connectivity_url)?;
         Ok(())
     }
 
-    pub fn is_target(&self, ssid: &str) -> bool {
-        self.targets.iter().any(|t| t == ssid)
+    pub fn is_target(&self, ssid: &str, connection_uuid: &str) -> bool {
+        self.targets
+            .iter()
+            .any(|target| target.matches(ssid, connection_uuid))
     }
+
+    pub fn portal_permission<'a>(&self, network: &'a NetworkState) -> PortalPermission<'a> {
+        match network {
+            NetworkState::Disconnected => PortalPermission::Disconnected,
+            NetworkState::Connected {
+                ssid,
+                connection_uuid,
+                ..
+            } if !self.is_target(ssid, connection_uuid) => PortalPermission::OtherNetwork(ssid),
+            NetworkState::Connected {
+                ssid,
+                is_activated: false,
+                ..
+            } => PortalPermission::Connecting(ssid),
+            NetworkState::Connected {
+                ssid,
+                is_default: false,
+                ..
+            } => PortalPermission::TargetNotDefault(ssid),
+            NetworkState::Connected {
+                ssid,
+                connection_uuid,
+                connectivity,
+                ..
+            } => PortalPermission::Allowed {
+                ssid,
+                connection_uuid,
+                connectivity: *connectivity,
+            },
+        }
+    }
+}
+
+fn validate_http_url(name: &str, value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value).with_context(|| format!("invalid {name} URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("{name} must use http or https");
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("{name} must include a host");
+    }
+    Ok(())
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    if let Some(p) = CONFIG_OVERRIDE.get() {
-        return Ok(p.clone());
+    if let Some(path) = CONFIG_OVERRIDE.get() {
+        return Ok(path.clone());
     }
-    if let Ok(custom) = std::env::var("WIFILOGIN_CONFIG") {
-        return Ok(PathBuf::from(custom));
+    if let Ok(path) = std::env::var("WIFILOGIN_CONFIG") {
+        return Ok(PathBuf::from(path));
     }
-    // Legacy alias from the latch days.
-    if let Ok(custom) = std::env::var("LATCH_CONFIG_PATH") {
-        return Ok(PathBuf::from(custom));
-    }
-    let base = dirs::config_dir().context("could not resolve config dir")?;
-    Ok(base.join("wifilogin").join(DEFAULT_CONFIG_FILE))
+    Ok(user_config_dir()?
+        .join("wifilogin")
+        .join(DEFAULT_CONFIG_FILE))
 }
 
-/// Load an existing config. Errors with an actionable message if missing —
-/// reading must never have the side effect of writing files.
+/// XDG configuration root, shared with the systemd user-unit installer.
+pub fn user_config_dir() -> Result<PathBuf> {
+    paths::config_dir()
+}
+
+/// Load an existing config. Reading configuration never creates files.
 pub fn load() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
@@ -153,22 +214,10 @@ pub fn load() -> Result<Config> {
         );
     }
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let cfg: Config = toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-    cfg.validate()?;
-    Ok(cfg)
-}
-
-/// Load, creating the default config if missing. Only the daemon should use
-/// this; one-shot commands want `load()` so they surface real errors.
-pub fn load_or_create() -> Result<Config> {
-    let path = config_path()?;
-    if path.exists() {
-        return load();
-    }
-    let cfg = Config::default();
-    save(&path, &cfg)?;
-    tracing::info!(path = %path.display(), "created default config");
-    Ok(cfg)
+    let config: Config =
+        toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    config.validate()?;
+    Ok(config)
 }
 
 /// Write the commented template. Refuses to clobber an existing file.
@@ -187,55 +236,76 @@ pub fn init() -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn save(path: &PathBuf, cfg: &Config) -> Result<()> {
-    cfg.validate()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-    let s = toml::to_string_pretty(cfg).context("encode config")?;
-    std::fs::write(path, s).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_is_valid() {
-        Config::default().validate().unwrap();
+    fn default_is_safe_and_valid() {
+        let config = Config::default();
+        config.validate().unwrap();
+        assert!(config.targets.is_empty());
     }
 
     #[test]
-    fn is_target() {
-        let c = Config {
-            targets: vec!["R-VIT".into(), "R-VIT-5G".into()],
+    fn target_matching_is_exact() {
+        let config = Config {
+            targets: vec![Target {
+                ssid: "Campus".into(),
+                connection_uuid: "d9428888-122b-11e1-b85c-61cd3cbb3210".into(),
+            }],
             ..Default::default()
         };
-        assert!(c.is_target("R-VIT"));
-        assert!(c.is_target("R-VIT-5G"));
-        assert!(!c.is_target("Other"));
+        assert!(config.is_target("Campus", "d9428888-122b-11e1-b85c-61cd3cbb3210"));
+        assert!(config.is_target("Campus", "D9428888-122B-11E1-B85C-61CD3CBB3210"));
+        assert!(!config.is_target("Campus-Guest", "d9428888-122b-11e1-b85c-61cd3cbb3210"));
+        assert!(!config.is_target("Campus", "2f1c5a60-6e1f-4c42-b2a8-0d1a9d2f3e40"));
     }
 
     #[test]
-    fn template_parses() {
-        let cfg: Config = toml::from_str(TEMPLATE).unwrap();
-        cfg.validate().unwrap();
-        assert_eq!(cfg.verify_interval, Duration::from_secs(60));
-        assert_eq!(cfg.retry_interval, Duration::from_secs(10));
+    fn template_parses_to_an_empty_allow_list() {
+        let config: Config = toml::from_str(TEMPLATE).unwrap();
+        config.validate().unwrap();
+        assert!(config.targets.is_empty());
     }
 
     #[test]
-    fn missing_config_is_actionable_error() {
-        // No override set and no real config path — just check load() doesn't create files.
-        let path = std::env::temp_dir().join(format!(
-            "wifilogin-test-missing-{}-{}.toml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        assert!(!path.exists());
+    fn obsolete_configuration_is_rejected() {
+        let error = toml::from_str::<Config>(
+            r#"
+                targets = []
+                portal_url = "https://portal.example"
+                verify_interval = "60s"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn non_http_urls_are_rejected() {
+        let config = Config {
+            portal_url: "file:///tmp/portal".into(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_target_uuid_is_rejected() {
+        let config = Config {
+            targets: vec![Target {
+                ssid: "Campus".into(),
+                connection_uuid: "not-a-uuid".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("targets[0]")
+        );
     }
 }

@@ -1,3 +1,4 @@
+use crate::paths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -5,12 +6,11 @@ use std::sync::{Arc, RwLock};
 
 const SETTINGS_FILE: &str = "settings.json";
 const DAEMON_STATE_FILE: &str = "daemon.json";
-const WAKE_FILE: &str = "wake";
+const CONTROL_SOCKET_FILE: &str = "control.sock";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
-    /// When false, daemon stays idle and never auto-connects or logs in.
-    /// Toggle via `wifilogin pause` / `wifilogin resume`.
+    /// When false, the daemon observes NetworkManager but never logs in.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 }
@@ -33,11 +33,10 @@ pub struct Manager {
 
 impl Manager {
     pub fn new() -> Result<Self> {
-        let path = settings_path()?;
-        Self::from_path(path)
+        Self::from_path(settings_path()?)
     }
 
-    /// Explicit path — also what tests use.
+    /// Explicit path, used by tests as well as production.
     pub fn from_path(path: PathBuf) -> Result<Self> {
         let settings = load_or_create(&path)?;
         Ok(Self {
@@ -47,88 +46,75 @@ impl Manager {
     }
 
     pub fn get(&self) -> Settings {
-        *self.inner.read().unwrap()
+        *self.inner.read().expect("settings lock poisoned")
     }
 
     pub fn set_enabled(&self, enabled: bool) -> Result<()> {
         {
-            let mut w = self.inner.write().unwrap();
-            w.enabled = enabled;
+            let mut settings = self.inner.write().expect("settings lock poisoned");
+            settings.enabled = enabled;
         }
-        save(&self.path, self.get())?;
-        Ok(())
+        save(&self.path, self.get())
     }
 
     pub fn reload(&self) -> Result<Settings> {
-        let s = load_or_create(&self.path)?;
-        *self.inner.write().unwrap() = s;
-        Ok(s)
+        let settings = load_or_create(&self.path)?;
+        *self.inner.write().expect("settings lock poisoned") = settings;
+        Ok(settings)
     }
 }
 
 pub fn settings_path() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var("WIFILOGIN_STATE_PATH") {
-        return Ok(PathBuf::from(custom));
-    }
-    // Legacy alias from the latch days.
-    if let Ok(custom) = std::env::var("LATCH_STATE_PATH") {
-        return Ok(PathBuf::from(custom));
-    }
-    let base = dirs::state_dir()
-        .or_else(dirs::data_local_dir)
-        .context("could not resolve state dir")?;
-    Ok(base.join("wifilogin").join(SETTINGS_FILE))
+    Ok(state_dir()?.join(SETTINGS_FILE))
 }
 
-/// File the daemon writes after every step so `wifilogin status` can show
-/// whether it's alive and what it last did.
+/// File the daemon writes after every state transition for `wifilogin status`.
 pub fn daemon_state_path() -> Result<PathBuf> {
     Ok(state_dir()?.join(DAEMON_STATE_FILE))
 }
 
-/// Touching this file wakes the daemon and makes it reload config, settings
-/// and credentials. Replaces the old pkill/SIGHUP hack.
-pub fn wake_path() -> Result<PathBuf> {
-    Ok(state_dir()?.join(WAKE_FILE))
+/// A local control datagram wakes the daemon without a filesystem watcher.
+pub fn control_socket_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join(CONTROL_SOCKET_FILE))
 }
 
+/// Ask a running daemon to reload its configuration and settings. A missing
+/// socket simply means the daemon is not running, which is harmless for CLI
+/// commands that update persistent state.
+#[cfg(unix)]
+pub fn request_reload() {
+    use std::os::unix::net::UnixDatagram;
+
+    if let Ok(socket) = UnixDatagram::unbound()
+        && let Ok(path) = control_socket_path()
+    {
+        let _ = socket.send_to(b"reload", path);
+    }
+}
+
+#[cfg(not(unix))]
+pub fn request_reload() {}
+
 fn state_dir() -> Result<PathBuf> {
-    Ok(settings_path()?
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default())
+    paths::state_dir().map(|path| path.join("wifilogin"))
 }
 
 fn load_or_create(path: &PathBuf) -> Result<Settings> {
     if !path.exists() {
-        let s = Settings::default();
-        save(path, s)?;
-        return Ok(s);
+        let settings = Settings::default();
+        save(path, settings)?;
+        return Ok(settings);
     }
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let s: Settings =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-    Ok(s)
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
 
-fn save(path: &PathBuf, s: Settings) -> Result<()> {
+fn save(path: &PathBuf, settings: Settings) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let data = serde_json::to_string_pretty(&s).context("encode settings")?;
-    std::fs::write(path, data + "\n").with_context(|| format!("write {}", path.display()))?;
-    Ok(())
-}
-
-/// Write an empty wake file so a running daemon picks up credential/config
-/// changes immediately. Best-effort; harmless if no daemon is running.
-pub fn wake_daemon() {
-    if let Ok(path) = wake_path()
-        && let Some(dir) = path.parent()
-        && std::fs::create_dir_all(dir).is_ok()
-    {
-        let _ = std::fs::write(&path, "");
-    }
+    let data = serde_json::to_string_pretty(&settings).context("encode settings")?;
+    std::fs::write(path, data + "\n").with_context(|| format!("write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -136,12 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_enabled() {
-        assert!(Settings::default().enabled);
-    }
-
-    #[test]
-    fn from_path_roundtrip() {
+    fn settings_round_trip() {
         let dir = std::env::temp_dir().join(format!(
             "wifilogin-settings-test-{}-{}",
             std::process::id(),
@@ -151,12 +132,10 @@ mod tests {
                 .as_nanos()
         ));
         let path = dir.join("settings.json");
-        let mgr = Manager::from_path(path.clone()).unwrap();
-        assert!(mgr.get().enabled);
-        mgr.set_enabled(false).unwrap();
-        // Re-read from disk
-        let mgr2 = Manager::from_path(path).unwrap();
-        assert!(!mgr2.get().enabled);
+        let manager = Manager::from_path(path.clone()).unwrap();
+        assert!(manager.get().enabled);
+        manager.set_enabled(false).unwrap();
+        assert!(!Manager::from_path(path).unwrap().get().enabled);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

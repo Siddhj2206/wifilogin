@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::time::Duration;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, Value};
 use zbus::{Connection, MessageStream, Proxy};
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
@@ -12,39 +11,60 @@ const NM_DEVICE_IFACE: &str = "org.freedesktop.NetworkManager.Device";
 const NM_WIRELESS_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
 const NM_AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 const NM_ACTIVE_CONN_IFACE: &str = "org.freedesktop.NetworkManager.Connection.Active";
-const NM_SETTINGS_PATH: &str = "/org/freedesktop/NetworkManager/Settings";
-const NM_SETTINGS_IFACE: &str = "org.freedesktop.NetworkManager.Settings";
-const NM_CONN_IFACE: &str = "org.freedesktop.NetworkManager.Settings.Connection";
 const DBUS_PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 const DEVICE_TYPE_WIFI: u32 = 2;
-const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const ACTIVE_CONNECTION_ACTIVATED: u32 = 2;
 
-#[derive(Debug, thiserror::Error)]
-#[error("no WiFi device found")]
-pub struct NoWifiDevice;
-
-#[derive(Debug, thiserror::Error)]
-#[error("saved wifi profile not found; connect once manually to {0}")]
-pub struct NeedsProvisioning(pub String);
-
-#[derive(Debug, Clone)]
-pub struct EnsureResult {
-    pub already_connected: bool,
-    pub connection_id: String,
+/// NetworkManager's connectivity assessment. It is deliberately distinct
+/// from reachability: only `Portal` authorizes an automatic login attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connectivity {
+    Unknown,
+    None,
+    Portal,
+    Limited,
+    Full,
 }
 
-/// Anything that can report the current SSID and activate a saved profile.
-/// A seam so the session controller can be tested without D-Bus.
-pub trait Wifi: Send + Sync {
-    async fn current_ssid(&self) -> Result<Option<String>>;
-    async fn ensure_connected(&self, target: &str) -> Result<EnsureResult>;
+impl Connectivity {
+    fn from_nm(value: u32) -> Self {
+        match value {
+            1 => Self::None,
+            2 => Self::Portal,
+            3 => Self::Limited,
+            4 => Self::Full,
+            _ => Self::Unknown,
+        }
+    }
 }
 
-/// Wake-up event. The daemon doesn't care *what* changed — it re-reads state
-/// via `current_ssid()` on every step, which also handles device hotplug.
-#[derive(Debug, Clone)]
+/// Facts needed to decide whether portal credentials may be submitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkState {
+    /// There is no Wi-Fi adapter, or it has no active access point.
+    Disconnected,
+    /// Wi-Fi is associated. `is_default` means NetworkManager uses that
+    /// connection for the default route rather than Ethernet or a VPN.
+    Connected {
+        ssid: String,
+        connection_uuid: String,
+        is_activated: bool,
+        is_default: bool,
+        connectivity: Connectivity,
+    },
+}
+
+/// D-Bus changes are intentionally collapsed: a fresh snapshot is more
+/// reliable than attempting to interpret every transition in a signal.
+#[derive(Debug, Clone, Copy)]
 pub enum Event {
-    Wake,
+    NetworkChanged,
+}
+
+/// The session controller's small seam. It neither scans for nor activates
+/// networks, so tests and production share the same safety rule.
+pub trait Wifi: Send + Sync {
+    async fn network_state(&self) -> Result<NetworkState>;
 }
 
 #[derive(Debug, Clone)]
@@ -52,14 +72,9 @@ pub struct Manager {
     conn: Connection,
 }
 
-// Connection is Clone, so the manager is too — lets the daemon and controller
-// share one system bus connection.
 impl Wifi for Manager {
-    async fn current_ssid(&self) -> Result<Option<String>> {
-        self.current_ssid().await
-    }
-    async fn ensure_connected(&self, target: &str) -> Result<EnsureResult> {
-        self.ensure_connected(target).await
+    async fn network_state(&self) -> Result<NetworkState> {
+        self.network_state().await
     }
 }
 
@@ -67,227 +82,253 @@ impl Manager {
     pub async fn new() -> Result<Self> {
         let conn = Connection::system()
             .await
-            .context("connect to system bus")?;
+            .context("connect to NetworkManager system bus")?;
         Ok(Self { conn })
     }
 
-    /// Current SSID on the WiFi device, if any. Re-resolves the device on
-    /// every call, so hotplugged/renamed devices are handled.
-    pub async fn current_ssid(&self) -> Result<Option<String>> {
-        let device = match self.wifi_device_path().await {
-            Ok(p) => p,
-            Err(e) if e.downcast_ref::<NoWifiDevice>().is_some() => return Ok(None),
-            Err(e) => return Err(e),
-        };
+    /// Reads one coherent-enough view of the active Wi-Fi connection. D-Bus
+    /// signals cause a new read, handling missed signals and device hotplug.
+    pub async fn network_state(&self) -> Result<NetworkState> {
+        let mut first_active = None;
+        let mut first_error = None;
 
-        let proxy = Proxy::new(&self.conn, NM_SERVICE, device, NM_WIRELESS_IFACE).await?;
-        let ap_path: OwnedObjectPath = proxy
+        for device_path in self.wifi_device_paths().await? {
+            match self.device_network_state(device_path).await {
+                Ok(Some(network)) if network.is_default_route() => return Ok(network),
+                Ok(Some(network)) if first_active.is_none() => first_active = Some(network),
+                Ok(Some(_)) | Ok(None) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+
+        match (first_active, first_error) {
+            (Some(network), _) => Ok(network),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(NetworkState::Disconnected),
+        }
+    }
+
+    async fn device_network_state(
+        &self,
+        device_path: OwnedObjectPath,
+    ) -> Result<Option<NetworkState>> {
+        let wireless = Proxy::new(
+            &self.conn,
+            NM_SERVICE,
+            device_path.clone(),
+            NM_WIRELESS_IFACE,
+        )
+        .await?;
+        let access_point: OwnedObjectPath = wireless
             .get_property("ActiveAccessPoint")
             .await
-            .context("read ActiveAccessPoint")?;
-
-        if ap_path.as_str() == "/" {
+            .context("read active Wi-Fi access point")?;
+        if access_point.as_str() == "/" {
             return Ok(None);
         }
 
-        let ap_proxy = Proxy::new(&self.conn, NM_SERVICE, ap_path, NM_AP_IFACE).await?;
-        let ssid_bytes: Vec<u8> = ap_proxy.get_property("Ssid").await.context("read Ssid")?;
-
-        if ssid_bytes.is_empty() {
+        let ap = Proxy::new(&self.conn, NM_SERVICE, access_point, NM_AP_IFACE).await?;
+        let ssid: Vec<u8> = ap.get_property("Ssid").await.context("read Wi-Fi SSID")?;
+        if ssid.is_empty() {
             return Ok(None);
         }
-        Ok(Some(String::from_utf8_lossy(&ssid_bytes).to_string()))
-    }
 
-    /// Activate a saved NM profile for `target` and wait until it is actually
-    /// activated (ActivateConnection only starts activation).
-    pub async fn ensure_connected(&self, target: &str) -> Result<EnsureResult> {
-        if let Some(cur) = self.current_ssid().await?
-            && cur == target
-        {
-            return Ok(EnsureResult {
-                already_connected: true,
-                connection_id: cur,
-            });
-        }
-
-        let (conn_path, conn_id) = self
-            .saved_connection_by_ssid(target)
-            .await?
-            .ok_or_else(|| NeedsProvisioning(target.to_string()))?;
-
-        let device_path = self.wifi_device_path().await?;
-
-        let nm_proxy = Proxy::new(&self.conn, NM_SERVICE, NM_PATH, NM_IFACE).await?;
-        let active_path: OwnedObjectPath = nm_proxy
-            .call(
-                "ActivateConnection",
-                &(conn_path, device_path, ObjectPath::try_from("/").unwrap()),
-            )
+        // ActiveConnection belongs to the base Device interface, while
+        // ActiveAccessPoint belongs to the Wireless interface.
+        let device = Proxy::new(&self.conn, NM_SERVICE, device_path, NM_DEVICE_IFACE).await?;
+        let active_connection: OwnedObjectPath = device
+            .get_property("ActiveConnection")
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("Not authorized")
-                    || msg.contains("not authorized")
-                    || msg.contains("AccessDenied")
-                    || msg.contains("Permission denied")
-                {
-                    anyhow::Error::new(NeedsProvisioning(target.to_string()))
-                } else {
-                    anyhow::anyhow!("ActivateConnection {}: {e}", conn_id)
-                }
-            })?;
-
-        self.wait_activated(&active_path, target).await?;
-
-        Ok(EnsureResult {
-            already_connected: false,
-            connection_id: conn_id,
-        })
-    }
-
-    async fn wait_activated(&self, active_path: &OwnedObjectPath, target: &str) -> Result<()> {
-        let proxy = Proxy::new(&self.conn, NM_SERVICE, active_path.clone(), NM_ACTIVE_CONN_IFACE)
-            .await?;
-        let deadline = tokio::time::Instant::now() + ACTIVATION_TIMEOUT;
-        loop {
-            let state: u32 = proxy.get_property("State").await.unwrap_or(0);
-            match state {
-                2 => return Ok(()), // NM_ACTIVE_CONNECTION_STATE_ACTIVATED
-                3 | 4 => {
-                    anyhow::bail!("activation of {target} failed or was deactivated");
-                }
-                _ => {}
-            }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("timed out waiting for {target} to activate");
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            .context("read active Wi-Fi connection")?;
+        if active_connection.as_str() == "/" {
+            return Ok(None);
         }
+        let active = Proxy::new(
+            &self.conn,
+            NM_SERVICE,
+            active_connection,
+            NM_ACTIVE_CONN_IFACE,
+        )
+        .await?;
+        let connection_uuid: String = active
+            .get_property("Uuid")
+            .await
+            .context("read active Wi-Fi connection UUID")?;
+        let is_activated = active
+            .get_property::<u32>("State")
+            .await
+            .map(|state| state == ACTIVE_CONNECTION_ACTIVATED)
+            .unwrap_or(false);
+        // `Default` covers IPv4 and `Default6` IPv6. Either is sufficient:
+        // portal traffic must be allowed on a connection that owns at least
+        // one default route.
+        let is_default = active.get_property("Default").await.unwrap_or(false)
+            || active.get_property("Default6").await.unwrap_or(false);
+
+        let manager = Proxy::new(&self.conn, NM_SERVICE, NM_PATH, NM_IFACE).await?;
+        let connectivity = manager
+            .get_property::<u32>("Connectivity")
+            .await
+            .map(Connectivity::from_nm)
+            .unwrap_or(Connectivity::Unknown);
+
+        Ok(Some(NetworkState::Connected {
+            ssid: String::from_utf8_lossy(&ssid).into_owned(),
+            connection_uuid,
+            is_activated,
+            is_default,
+            connectivity,
+        }))
     }
 
-    /// Event stream: D-Bus PropertiesChanged for any NM device State or
-    /// ActiveAccessPoint change. Matches are not pinned to one device path so
-    /// suspend/resume and hotplug don't silently kill the watch.
+    /// Subscribe before the daemon begins processing. This watches
+    /// connectivity, default-route changes, Wi-Fi association, and active
+    /// connection state; no periodic D-Bus or HTTP polling is used.
     pub async fn watch(&self) -> Result<tokio::sync::mpsc::Receiver<Event>> {
-        let rules = [
-            format!(
-                "type='signal',sender='{NM_SERVICE}',interface='{DBUS_PROPS_IFACE}',member='PropertiesChanged',arg0='{NM_DEVICE_IFACE}'"
-            ),
-            format!(
-                "type='signal',sender='{NM_SERVICE}',interface='{DBUS_PROPS_IFACE}',member='PropertiesChanged',arg0='{NM_WIRELESS_IFACE}'"
-            ),
-        ];
-        for rule in &rules {
-            self.add_match_raw(rule).await?;
+        for interface in [
+            NM_IFACE,
+            NM_DEVICE_IFACE,
+            NM_WIRELESS_IFACE,
+            NM_ACTIVE_CONN_IFACE,
+        ] {
+            self.add_match_raw(&format!(
+                "type='signal',sender='{NM_SERVICE}',interface='{DBUS_PROPS_IFACE}',member='PropertiesChanged',arg0='{interface}'"
+            ))
+            .await?;
         }
+        for (interface, member) in [
+            (NM_IFACE, "DeviceAdded"),
+            (NM_IFACE, "DeviceRemoved"),
+            (NM_IFACE, "StateChanged"),
+            (NM_DEVICE_IFACE, "StateChanged"),
+            (NM_ACTIVE_CONN_IFACE, "StateChanged"),
+        ] {
+            self.add_match_raw(&format!(
+                "type='signal',sender='{NM_SERVICE}',interface='{interface}',member='{member}'"
+            ))
+            .await?;
+        }
+        self.add_match_raw(&format!(
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='{NM_SERVICE}'"
+        ))
+        .await?;
 
         let mut stream = MessageStream::from(self.conn.clone());
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
         tokio::spawn(async move {
-            while let Some(msg) = stream.next().await {
-                let Ok(msg) = msg else { continue };
-                let header = msg.header();
+            while let Some(message) = stream.next().await {
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::warn!(%error, "NetworkManager D-Bus event stream failed");
+                        break;
+                    }
+                };
+                let header = message.header();
                 if header.message_type() != zbus::message::Type::Signal {
                     continue;
                 }
-                if header
-                    .member()
-                    .map(|m| m.as_str() != "PropertiesChanged")
-                    .unwrap_or(true)
-                {
+                let interface = header.interface().map(|interface| interface.as_str());
+                let member = header.member().map(|member| member.as_str());
+                if is_lifecycle_signal(interface, member) {
+                    let _ = sender.try_send(Event::NetworkChanged);
                     continue;
                 }
-                // Body: (interface, a{sv} changed, as invalidated)
-                let body = msg.body();
-                let Ok((iface, changed, _invalidated)): Result<
+                if interface != Some(DBUS_PROPS_IFACE) || member != Some("PropertiesChanged") {
+                    continue;
+                }
+                let body = message.body();
+                let Ok((interface, changed, _invalidated)): Result<
                     (String, HashMap<String, Value<'_>>, Vec<String>),
                     _,
-                > = body.deserialize()
-                else {
+                > = body.deserialize() else {
                     continue;
                 };
-                let relevant = match iface.as_str() {
-                    NM_DEVICE_IFACE => changed.contains_key("State"),
-                    NM_WIRELESS_IFACE => changed.contains_key("ActiveAccessPoint"),
-                    _ => false,
-                };
-                if relevant && tx.send(Event::Wake).await.is_err() {
-                    break; // receiver dropped — daemon is shutting down
+                if affects_network_state(&interface, &changed) {
+                    // One pending event is enough: processing it reads a fresh
+                    // snapshot. Dropping duplicates prevents signal storms.
+                    let _ = sender.try_send(Event::NetworkChanged);
                 }
             }
         });
-
-        Ok(rx)
+        Ok(receiver)
     }
 
     async fn add_match_raw(&self, rule: &str) -> Result<()> {
-        let proxy = Proxy::new(
+        let dbus = Proxy::new(
             &self.conn,
             "org.freedesktop.DBus",
             "/org/freedesktop/DBus",
             "org.freedesktop.DBus",
         )
         .await?;
-        proxy.call::<_, _, ()>("AddMatch", &(rule,)).await?;
+        dbus.call::<_, _, ()>("AddMatch", &(rule,)).await?;
         Ok(())
     }
 
-    async fn wifi_device_path(&self) -> Result<OwnedObjectPath> {
-        let proxy = Proxy::new(&self.conn, NM_SERVICE, NM_PATH, NM_IFACE).await?;
-        let devices: Vec<OwnedObjectPath> =
-            proxy.call("GetDevices", &()).await.context("GetDevices")?;
-
+    async fn wifi_device_paths(&self) -> Result<Vec<OwnedObjectPath>> {
+        let manager = Proxy::new(&self.conn, NM_SERVICE, NM_PATH, NM_IFACE).await?;
+        let devices: Vec<OwnedObjectPath> = manager.call("GetDevices", &()).await?;
+        let mut wifi_devices = Vec::new();
         for path in devices {
-            let p = Proxy::new(&self.conn, NM_SERVICE, path.clone(), NM_DEVICE_IFACE).await?;
-            let Ok(dtype): Result<u32, _> = p.get_property("DeviceType").await else {
-                continue;
-            };
-            if dtype == DEVICE_TYPE_WIFI {
-                return Ok(path);
+            let device = Proxy::new(&self.conn, NM_SERVICE, path.clone(), NM_DEVICE_IFACE).await?;
+            if device.get_property::<u32>("DeviceType").await.ok() == Some(DEVICE_TYPE_WIFI) {
+                wifi_devices.push(path);
             }
         }
-        Err(NoWifiDevice.into())
-    }
-
-    async fn saved_connection_by_ssid(
-        &self,
-        target: &str,
-    ) -> Result<Option<(OwnedObjectPath, String)>> {
-        let proxy = Proxy::new(&self.conn, NM_SERVICE, NM_SETTINGS_PATH, NM_SETTINGS_IFACE).await?;
-        let conns: Vec<OwnedObjectPath> = proxy
-            .call("ListConnections", &())
-            .await
-            .context("ListConnections")?;
-
-        for path in conns {
-            let cproxy = Proxy::new(&self.conn, NM_SERVICE, path.clone(), NM_CONN_IFACE).await?;
-            let settings: HashMap<String, HashMap<String, OwnedValue>> =
-                match cproxy.call("GetSettings", &()).await {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-            let Some(wsec) = settings.get("802-11-wireless") else {
-                continue;
-            };
-            let Some(v) = wsec.get("ssid") else { continue };
-            let Ok(ssid_bytes) = Vec::<u8>::try_from(v.clone()) else { continue };
-            let ssid = String::from_utf8_lossy(&ssid_bytes).to_string();
-            if ssid != target {
-                continue;
-            }
-            let id = settings
-                .get("connection")
-                .and_then(|m| m.get("id"))
-                .and_then(|v| String::try_from(v.clone()).ok())
-                .unwrap_or_else(|| ssid.clone());
-            return Ok(Some((path, id)));
-        }
-        Ok(None)
+        Ok(wifi_devices)
     }
 }
 
-pub fn is_provisioning(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<NeedsProvisioning>().is_some()
+fn is_lifecycle_signal(interface: Option<&str>, member: Option<&str>) -> bool {
+    matches!(
+        (interface, member),
+        (
+            Some(NM_IFACE),
+            Some("DeviceAdded" | "DeviceRemoved" | "StateChanged")
+        ) | (
+            Some(NM_DEVICE_IFACE | NM_ACTIVE_CONN_IFACE),
+            Some("StateChanged")
+        ) | (Some("org.freedesktop.DBus"), Some("NameOwnerChanged"))
+    )
+}
+
+impl NetworkState {
+    fn is_default_route(&self) -> bool {
+        matches!(
+            self,
+            Self::Connected {
+                is_default: true,
+                ..
+            }
+        )
+    }
+}
+
+fn affects_network_state(interface: &str, changed: &HashMap<String, Value<'_>>) -> bool {
+    match interface {
+        NM_IFACE => {
+            changed.contains_key("Connectivity") || changed.contains_key("PrimaryConnection")
+        }
+        NM_DEVICE_IFACE => changed.contains_key("State"),
+        NM_WIRELESS_IFACE => {
+            changed.contains_key("ActiveAccessPoint") || changed.contains_key("ActiveConnection")
+        }
+        NM_ACTIVE_CONN_IFACE => changed.contains_key("State") || changed.contains_key("Default"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_networkmanager_connectivity_values() {
+        assert_eq!(Connectivity::from_nm(0), Connectivity::Unknown);
+        assert_eq!(Connectivity::from_nm(2), Connectivity::Portal);
+        assert_eq!(Connectivity::from_nm(4), Connectivity::Full);
+        assert_eq!(Connectivity::from_nm(99), Connectivity::Unknown);
+    }
 }

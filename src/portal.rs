@@ -3,8 +3,7 @@ use std::time::Duration;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_BODY: usize = 1024 * 1024;
-const SNIPPET: usize = 1024;
+const MAX_RESPONSE_BODY: usize = 1024 * 1024;
 const USER_AGENT: &str = concat!("wifilogin/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,15 +29,13 @@ impl std::fmt::Display for Outcome {
 pub struct LoginResult {
     pub outcome: Outcome,
     pub http_status: u16,
-    pub body_snippet: String,
 }
 
 /// Portal + connectivity checks. A seam so the session controller can be
 /// tested without network access.
 pub trait Portal: Send + Sync {
     async fn online(&self, connectivity_url: &str) -> Result<bool>;
-    async fn login(&self, portal_url: &str, username: &str, password: &str)
-    -> Result<LoginResult>;
+    async fn login(&self, portal_url: &str, username: &str, password: &str) -> Result<LoginResult>;
 }
 
 pub struct PortalClient;
@@ -63,12 +60,7 @@ impl Portal for PortalClient {
     }
 
     /// POST to the Pronto Networks portal.
-    async fn login(
-        &self,
-        portal_url: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<LoginResult> {
+    async fn login(&self, portal_url: &str, username: &str, password: &str) -> Result<LoginResult> {
         if portal_url.is_empty() {
             anyhow::bail!("portal_url is required");
         }
@@ -84,7 +76,7 @@ impl Portal for PortalClient {
             ("Submit22", "Login"),
         ];
 
-        let resp = client
+        let mut resp = client
             .post(portal_url)
             .form(&params)
             .header("User-Agent", USER_AGENT)
@@ -94,18 +86,20 @@ impl Portal for PortalClient {
             .map_err(|e| anyhow::anyhow!("post login form: {e}"))?;
 
         let status = resp.status().as_u16();
-        let body = resp
-            .bytes()
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| anyhow::anyhow!("read body: {e}"))?;
+            .map_err(|error| anyhow::anyhow!("read portal response: {error}"))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY {
+                anyhow::bail!("portal response exceeds {MAX_RESPONSE_BODY} bytes");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body);
 
-        let body_limited = &body[..body.len().min(MAX_BODY)];
-        let body_str = String::from_utf8_lossy(body_limited);
-        // Char-boundary-safe truncation: the portal is not the only one who
-        // can produce multi-byte UTF-8, and a naive byte slice panics.
-        let snippet = truncate(body_str.trim(), SNIPPET).to_string();
-
-        let mut outcome = classify(&body_str);
+        let mut outcome = classify(&body);
         if status >= 400 && outcome == Outcome::Uncertain {
             outcome = Outcome::HttpError;
         }
@@ -113,20 +107,8 @@ impl Portal for PortalClient {
         Ok(LoginResult {
             outcome,
             http_status: status,
-            body_snippet: snippet,
         })
     }
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 pub(crate) fn classify(body: &str) -> Outcome {
@@ -164,15 +146,5 @@ mod tests {
     #[test]
     fn classify_uncertain() {
         assert_eq!(classify("something else"), Outcome::Uncertain);
-    }
-
-    #[test]
-    fn truncate_is_char_boundary_safe() {
-        // "é" is 2 bytes; slicing at 1 would panic without the boundary walk.
-        let s = "ééééé".repeat(300); // 3000 bytes, 1500 chars
-        let t = truncate(&s, 1024);
-        assert!(t.len() <= 1024);
-        assert_eq!(t.chars().count(), 512);
-        assert!(s.ends_with(t) || t.is_empty());
     }
 }
