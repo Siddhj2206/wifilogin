@@ -1,8 +1,8 @@
 use anyhow::Result;
 
 const SERVICE: &str = "wifilogin";
-const USER_KEY: &str = "username";
 const PASS_KEY: &str = "password";
+const LEGACY_USER_KEY: &str = "username";
 
 #[derive(Debug)]
 pub struct NotFound;
@@ -15,16 +15,16 @@ impl std::fmt::Display for NotFound {
 
 impl std::error::Error for NotFound {}
 
-/// Source of portal credentials. A seam so the session controller can be
-/// tested without touching the real keyring.
+/// Source of portal passwords. A seam so the session controller can be tested
+/// without touching the real keyring.
 pub trait Creds: Send + Sync {
-    async fn load(&self) -> Result<(String, String)>;
+    async fn load(&self) -> Result<String>;
 }
 
 pub struct KeyringCreds;
 
 impl Creds for KeyringCreds {
-    async fn load(&self) -> Result<(String, String)> {
+    async fn load(&self) -> Result<String> {
         load().await
     }
 }
@@ -52,35 +52,27 @@ where
     .map_err(|e| anyhow::anyhow!("keyring join: {e}"))?
 }
 
-pub async fn store(username: &str, password: &str) -> Result<()> {
-    if username.trim().is_empty() {
-        anyhow::bail!("username is required");
-    }
+pub async fn store(password: &str) -> Result<()> {
     if password.is_empty() {
         anyhow::bail!("password is required");
     }
-    let u = username.to_string();
     let p = password.to_string();
     on_keyring_thread(move || {
-        let user_entry = keyring::Entry::new(SERVICE, USER_KEY)?;
         let pass_entry = keyring::Entry::new(SERVICE, PASS_KEY)?;
-        user_entry.set_password(&u)?;
         pass_entry.set_password(&p)?;
         Ok(())
     })
     .await
 }
 
-pub async fn load() -> Result<(String, String)> {
+pub async fn load() -> Result<String> {
     on_keyring_thread(|| try_load(SERVICE)).await
 }
 
-fn try_load(service: &str) -> Result<(String, String)> {
-    let user_entry = keyring::Entry::new(service, USER_KEY)?;
+fn try_load(service: &str) -> Result<String> {
     let pass_entry = keyring::Entry::new(service, PASS_KEY)?;
-    let u = user_entry.get_password().map_err(map_not_found)?;
     let p = pass_entry.get_password().map_err(map_not_found)?;
-    Ok((u, p))
+    Ok(p)
 }
 
 fn map_not_found(e: keyring::Error) -> anyhow::Error {
@@ -92,8 +84,8 @@ fn map_not_found(e: keyring::Error) -> anyhow::Error {
 
 pub async fn delete() -> Result<()> {
     on_keyring_thread(|| {
-        delete_entry(USER_KEY)?;
         delete_entry(PASS_KEY)?;
+        delete_entry(LEGACY_USER_KEY)?;
         Ok(())
     })
     .await

@@ -14,23 +14,6 @@ pub fn set_config_override(path: PathBuf) -> bool {
     CONFIG_OVERRIDE.set(path).is_ok()
 }
 
-/// One trusted NetworkManager connection on which credentials may be submitted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Target {
-    /// Displayed Wi-Fi name. It prevents surprising behavior in status output.
-    pub ssid: String,
-    /// NetworkManager connection UUID. Unlike an SSID, this is tied to the
-    /// local profile the user explicitly created and selected.
-    pub connection_uuid: String,
-}
-
-impl Target {
-    pub fn matches(&self, ssid: &str, connection_uuid: &str) -> bool {
-        self.ssid == ssid && self.connection_uuid.eq_ignore_ascii_case(connection_uuid)
-    }
-}
-
 /// Why the active Wi-Fi connection may or may not receive portal credentials.
 /// Both automatic and explicit login use this same classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,9 +37,12 @@ pub enum PortalPermission<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Explicit local NetworkManager connections on which login is permitted.
+    /// Wi-Fi names on which portal login is permitted.
     #[serde(default)]
-    pub targets: Vec<Target>,
+    pub targets: Vec<String>,
+    /// Portal username. Passwords are stored separately in the system keyring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     /// Captive portal login endpoint.
     pub portal_url: String,
     /// URL that must answer HTTP 204 after a login. It is used only to verify
@@ -73,9 +59,10 @@ fn default_connectivity_url() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // An empty allow-list is safe: a new installation cannot join or
-            // authenticate to any network until its owner opts in.
-            targets: Vec::new(),
+            // VIT's campus Wi-Fi name. The daemon still requires a password
+            // in the keyring and NetworkManager's Portal state before acting.
+            targets: vec!["R-VIT".to_string()],
+            username: None,
             portal_url: "http://phc.prontonetworks.com/cgi-bin/authlogin?URI=".to_string(),
             connectivity_url: default_connectivity_url(),
         }
@@ -85,18 +72,13 @@ impl Default for Config {
 /// Commented template written by `wifilogin config init`.
 pub const TEMPLATE: &str = r#"# wifilogin configuration
 
-# Local NetworkManager connections where wifilogin may submit credentials.
-# This is deliberately empty by default. The daemon NEVER joins WiFi or
-# changes NetworkManager's autoconnect behavior; it only acts after you or
-# NetworkManager have connected to a listed local profile.
-#
-# Replace `targets = []` with one block per intended connection. Obtain its
-# UUID with: nmcli -g UUID connection show "Campus WiFi"
-#
-# [[targets]]
-# ssid = "Campus WiFi"
-# connection_uuid = "00000000-0000-0000-0000-000000000000"
-targets = []
+# VIT Wi-Fi name where wifilogin may submit credentials. The daemon NEVER
+# joins Wi-Fi or changes NetworkManager's autoconnect behavior.
+targets = ["R-VIT"]
+
+# Your VIT username. `wifilogin setup` or `wifilogin creds set` writes this
+# without requiring you to open this file.
+# username = "your-vtop-username"
 
 # Captive portal login endpoint (Pronto Networks default shown).
 portal_url = "http://phc.prontonetworks.com/cgi-bin/authlogin?URI="
@@ -109,15 +91,16 @@ connectivity_url = "http://clients3.google.com/generate_204"
 impl Config {
     pub fn validate(&self) -> Result<()> {
         for (index, target) in self.targets.iter().enumerate() {
-            if target.ssid.trim().is_empty() {
-                anyhow::bail!("targets[{index}].ssid must not be empty");
+            if target.trim().is_empty() {
+                anyhow::bail!("targets[{index}] must not be empty");
             }
-            if !is_uuid(&target.connection_uuid) {
-                anyhow::bail!(
-                    "targets[{index}] ({}) has an invalid connection_uuid; expected a UUID",
-                    target.ssid
-                );
-            }
+        }
+        if self
+            .username
+            .as_deref()
+            .is_some_and(|username| username.trim().is_empty())
+        {
+            anyhow::bail!("username must not be empty");
         }
         if self.portal_url.trim().is_empty() {
             anyhow::bail!("portal_url is required");
@@ -130,20 +113,16 @@ impl Config {
         Ok(())
     }
 
-    pub fn is_target(&self, ssid: &str, connection_uuid: &str) -> bool {
-        self.targets
-            .iter()
-            .any(|target| target.matches(ssid, connection_uuid))
+    pub fn is_target(&self, ssid: &str) -> bool {
+        self.targets.iter().any(|target| target == ssid)
     }
 
     pub fn portal_permission<'a>(&self, network: &'a NetworkState) -> PortalPermission<'a> {
         match network {
             NetworkState::Disconnected => PortalPermission::Disconnected,
-            NetworkState::Connected {
-                ssid,
-                connection_uuid,
-                ..
-            } if !self.is_target(ssid, connection_uuid) => PortalPermission::OtherNetwork(ssid),
+            NetworkState::Connected { ssid, .. } if !self.is_target(ssid) => {
+                PortalPermission::OtherNetwork(ssid)
+            }
             NetworkState::Connected {
                 ssid,
                 is_activated: false,
@@ -179,14 +158,6 @@ fn validate_http_url(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-}
-
 pub fn config_path() -> Result<PathBuf> {
     if let Some(path) = CONFIG_OVERRIDE.get() {
         return Ok(path.clone());
@@ -209,7 +180,7 @@ pub fn load() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
         anyhow::bail!(
-            "no config at {} — run `wifilogin config init` to create one",
+            "no config at {} — run `wifilogin setup` to configure VIT Wi-Fi",
             path.display()
         );
     }
@@ -236,6 +207,29 @@ pub fn init() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Replace the configuration with the VIT defaults and the supplied username.
+/// The password deliberately never enters this file.
+pub fn setup(username: String) -> Result<PathBuf> {
+    let config = Config {
+        username: Some(username),
+        ..Config::default()
+    };
+    save(&config)
+}
+
+/// Validate and write the complete configuration. This is used by CLI
+/// commands so people do not need to edit TOML for normal setup.
+pub fn save(config: &Config) -> Result<PathBuf> {
+    config.validate()?;
+    let path = config_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let raw = toml::to_string_pretty(config).context("encode configuration")?;
+    std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,29 +238,25 @@ mod tests {
     fn default_is_safe_and_valid() {
         let config = Config::default();
         config.validate().unwrap();
-        assert!(config.targets.is_empty());
+        assert_eq!(config.targets, ["R-VIT"]);
+        assert_eq!(config.username, None);
     }
 
     #[test]
     fn target_matching_is_exact() {
         let config = Config {
-            targets: vec![Target {
-                ssid: "Campus".into(),
-                connection_uuid: "d9428888-122b-11e1-b85c-61cd3cbb3210".into(),
-            }],
+            targets: vec!["Campus".into()],
             ..Default::default()
         };
-        assert!(config.is_target("Campus", "d9428888-122b-11e1-b85c-61cd3cbb3210"));
-        assert!(config.is_target("Campus", "D9428888-122B-11E1-B85C-61CD3CBB3210"));
-        assert!(!config.is_target("Campus-Guest", "d9428888-122b-11e1-b85c-61cd3cbb3210"));
-        assert!(!config.is_target("Campus", "2f1c5a60-6e1f-4c42-b2a8-0d1a9d2f3e40"));
+        assert!(config.is_target("Campus"));
+        assert!(!config.is_target("Campus-Guest"));
     }
 
     #[test]
-    fn template_parses_to_an_empty_allow_list() {
+    fn template_parses_to_the_vit_allow_list() {
         let config: Config = toml::from_str(TEMPLATE).unwrap();
         config.validate().unwrap();
-        assert!(config.targets.is_empty());
+        assert_eq!(config.targets, ["R-VIT"]);
     }
 
     #[test]
@@ -292,12 +282,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_target_uuid_is_rejected() {
+    fn empty_target_is_rejected() {
         let config = Config {
-            targets: vec![Target {
-                ssid: "Campus".into(),
-                connection_uuid: "not-a-uuid".into(),
-            }],
+            targets: vec!["".into()],
             ..Default::default()
         };
         assert!(

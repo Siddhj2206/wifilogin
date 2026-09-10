@@ -1,7 +1,7 @@
 # wifilogin
 
-`wifilogin` submits captive-portal credentials for explicitly allowed Wi-Fi
-networks managed by NetworkManager. It is designed to be safe to leave running:
+`wifilogin` submits VIT captive-portal credentials for the `R-VIT` Wi-Fi
+network managed by NetworkManager. It is designed to be safe to leave running:
 it never scans for, connects to, disconnects from, or changes the autoconnect
 policy of a network.
 
@@ -9,15 +9,15 @@ policy of a network.
 
 The daemon will submit credentials only when all of these conditions are true:
 
-1. Wi-Fi is already associated with a `targets` entry's exact SSID and local
-   NetworkManager connection UUID.
+1. Wi-Fi is already associated with the configured `R-VIT` target SSID.
 2. That Wi-Fi connection is NetworkManager's default route.
 3. NetworkManager reports its connectivity as `Portal`.
-4. Automatic login is not paused and credentials are in the system keyring.
+4. Automatic login is not paused, a username is configured, and the password is
+   in the system keyring.
 
 This means a phone hotspot, an unlisted coffee-shop network, Ethernet, or a VPN
-that becomes the preferred route is left alone. An empty `targets` list is
-valid and is the safe default.
+that becomes the preferred route is left alone. A target list is an allowlist;
+it does not tell NetworkManager to join those networks.
 
 NetworkManager D-Bus signals drive normal operation: association, default-route
 and connectivity changes each trigger a fresh state read. There is no periodic
@@ -28,28 +28,20 @@ response.
 ## Setup
 
 ```sh
-wifilogin config init
-$EDITOR "$(wifilogin config path)"
-wifilogin creds set my-portal-user
-wifilogin service install
+cargo install --path .
+wifilogin setup
 ```
 
-Replace the empty `targets` list with one entry for each local NetworkManager
-profile where submitting the configured credentials is intended. Get the UUID
-with `nmcli -g UUID connection show "Campus WiFi"`:
+Install the executable first so the systemd unit has a stable path. The setup
+command prompts for your VIT username and password, writes the VIT target list
+and username to its config, stores only the password in the system keyring, and
+installs/starts the systemd user service. To configure credentials without
+installing the service, run `wifilogin setup --no-service`.
 
-```toml
-[[targets]]
-ssid = "Campus WiFi"
-connection_uuid = "00000000-0000-0000-0000-000000000000"
-
-[[targets]]
-ssid = "Campus WiFi 5G"
-connection_uuid = "11111111-1111-1111-1111-111111111111"
-
-portal_url = "http://portal.example.invalid/login"
-connectivity_url = "http://clients3.google.com/generate_204"
-```
+No editor is required for normal use. `wifilogin creds set <username>` updates
+the configured username and keyring password later. `wifilogin config show`
+and `wifilogin config edit` remain available only for diagnostics and unusual
+configuration changes.
 
 `connectivity_url` is requested once after a submitted login to verify its
 result. NetworkManager's connectivity status—not that URL—decides whether the
@@ -61,9 +53,10 @@ daemon starts an automatic login.
 | --- | --- |
 | `wifilogin status` | Show the daemon's last state and live NetworkManager state. |
 | `wifilogin pause` / `resume` | Disable or enable automatic login without stopping the daemon. |
-| `wifilogin creds set [username]` | Store credentials in the system keyring. |
+| `wifilogin setup [username]` | Configure the VIT target list and username, securely store the password, and install/start the user service. |
+| `wifilogin creds set [username]` | Update the config username and the password in the system keyring. |
 | `wifilogin config edit` | Edit, validate, and reload configuration. |
-| `wifilogin login` | Submit credentials now, but only on an allowed active profile that owns the default route. |
+| `wifilogin login` | Submit credentials now, but only on an allowed target Wi-Fi network that owns the default route. |
 | `wifilogin online` | Run a one-off HTTP connectivity check. |
 | `wifilogin service install` | Install and start the systemd user service. |
 

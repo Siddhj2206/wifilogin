@@ -24,7 +24,7 @@ use wifi::{Manager, NetworkState};
     name = "wifilogin",
     version,
     about = "D-Bus-driven captive-portal login for NetworkManager on Linux",
-    after_help = "Setup:\n  wifilogin config init\n  # Add only portal SSIDs you trust to targets.\n  wifilogin creds set myuser\n  wifilogin service install"
+    after_help = "Set up VIT Wi-Fi:\n  wifilogin setup\n\nThis stores your username and the R-VIT target list in config, prompts for a password in the system keyring, then starts the user service."
 )]
 struct Cli {
     /// Config file location (default: $XDG_CONFIG_HOME/wifilogin/config.toml)
@@ -36,6 +36,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Set up VIT targets, portal username, password, and user service (replaces config).
+    Setup {
+        /// VIT username (prompted if omitted).
+        username: Option<String>,
+        /// Read the password from stdin instead of prompting securely.
+        #[arg(long)]
+        stdin: bool,
+        /// Configure credentials but do not install or start the user service.
+        #[arg(long)]
+        no_service: bool,
+    },
     /// Run the daemon (the default). Never connects to Wi-Fi itself.
     Run,
     /// Show the daemon's last state and current NetworkManager state.
@@ -48,7 +59,7 @@ enum Command {
     Pause,
     /// Resume automatic login.
     Resume,
-    /// Manage portal credentials in the system keyring.
+    /// Manage the portal username and password.
     Creds {
         #[command(subcommand)]
         operation: CredsOp,
@@ -67,7 +78,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum CredsOp {
-    /// Store credentials. The password is prompted securely unless --stdin is used.
+    /// Store the username in config and password in the system keyring.
     Set {
         username: Option<String>,
         #[arg(long)]
@@ -121,6 +132,11 @@ async fn main() -> Result<()> {
     }
 
     match cli.command.unwrap_or(Command::Run) {
+        Command::Setup {
+            username,
+            stdin,
+            no_service,
+        } => cmd_setup(username, stdin, no_service).await,
         Command::Run => run_daemon().await,
         Command::Status => cmd_status().await,
         Command::Online => cmd_online().await,
@@ -179,7 +195,7 @@ async fn cmd_status() -> Result<()> {
         } => {
             let allowed = config
                 .as_ref()
-                .is_some_and(|config| config.is_target(&ssid, &connection_uuid));
+                .is_some_and(|config| config.is_target(&ssid));
             println!("wifi: {ssid} (allowed portal network: {allowed})");
             println!("NetworkManager connection: {connection_uuid}");
             println!(
@@ -193,10 +209,21 @@ async fn cmd_status() -> Result<()> {
             println!("NetworkManager connectivity: {connectivity:?}");
         }
     }
-    match keyring::load().await {
-        Ok((username, _)) => println!("creds: present ({username})"),
-        Err(error) if keyring::is_not_found(&error) => println!("creds: missing"),
-        Err(error) => println!("creds: error: {error}"),
+    match (
+        config
+            .as_ref()
+            .and_then(|config| config.username.as_deref()),
+        keyring::load().await,
+    ) {
+        (Some(username), Ok(_)) => println!("creds: password present ({username})"),
+        (None, Ok(_)) => println!("creds: password present; username missing from config"),
+        (Some(username), Err(error)) if keyring::is_not_found(&error) => {
+            println!("creds: password missing ({username})")
+        }
+        (None, Err(error)) if keyring::is_not_found(&error) => {
+            println!("creds: username and password missing")
+        }
+        (_, Err(error)) => println!("creds: error: {error}"),
     }
     println!("config: {}", config::config_path()?.display());
     Ok(())
@@ -234,16 +261,20 @@ async fn cmd_online() -> Result<()> {
 async fn cmd_login() -> Result<()> {
     let config = config::load()?;
     let authorized_connection = require_authorized_connection(&config).await?;
-    let (username, password) = keyring::load()
+    let username = config
+        .username
+        .as_deref()
+        .context("no username — run `wifilogin setup` or `wifilogin creds set <username>`")?;
+    let password = keyring::load()
         .await
-        .context("no credentials — run `wifilogin creds set <username>`")?;
+        .context("no password — run `wifilogin setup` or `wifilogin creds set <username>`")?;
     if require_authorized_connection(&config).await? != authorized_connection {
         anyhow::bail!("refusing portal login: the active Wi-Fi connection changed");
     }
     let portal = portal::PortalClient;
     println!("logging in to {} as {username}…", config.portal_url);
     let result = portal
-        .login(&config.portal_url, &username, &password)
+        .login(&config.portal_url, username, &password)
         .await?;
     println!("portal: {} (HTTP {})", result.outcome, result.http_status);
     if result.outcome == portal::Outcome::BadCredentials {
@@ -263,7 +294,7 @@ async fn cmd_login() -> Result<()> {
 }
 
 /// The explicit command shares the daemon's network-identity guard. It may
-/// bypass NetworkManager's `Portal` assessment, but never the target profile,
+/// bypass NetworkManager's `Portal` assessment, but never the target SSID,
 /// activation, or default-route requirements.
 async fn require_authorized_connection(config: &config::Config) -> Result<(String, String)> {
     let network = Manager::new().await?.network_state().await?;
@@ -277,7 +308,7 @@ async fn require_authorized_connection(config: &config::Config) -> Result<(Strin
             anyhow::bail!("refusing portal login: Wi-Fi is disconnected");
         }
         config::PortalPermission::OtherNetwork(ssid) => {
-            anyhow::bail!("refusing portal login: {ssid} is not an allowed target connection");
+            anyhow::bail!("refusing portal login: {ssid} is not an allowed target Wi-Fi network");
         }
         config::PortalPermission::Connecting(ssid) => {
             anyhow::bail!("refusing portal login: {ssid} is still changing state");
@@ -288,24 +319,54 @@ async fn require_authorized_connection(config: &config::Config) -> Result<(Strin
     }
 }
 
+/// Configure the fixed VIT portal defaults without asking people to edit TOML.
+/// This intentionally replaces an existing wifilogin configuration; passwords
+/// are stored only in the system keyring.
+async fn cmd_setup(username: Option<String>, stdin: bool, no_service: bool) -> Result<()> {
+    let username = username.unwrap_or(prompt_username()?);
+    let password = prompt_password(stdin)?;
+    let path = config::setup(username.clone())?;
+    keyring::store(&password)
+        .await
+        .context("store password in the system keyring")?;
+    settings::request_reload();
+    println!("configured VIT target R-VIT for {username}");
+    println!("saved username to {}", path.display());
+    println!("stored password in the system keyring");
+    if no_service {
+        println!("user service not installed (--no-service)");
+        return Ok(());
+    }
+    service::install()
+}
+
 async fn cmd_creds(operation: CredsOp) -> Result<()> {
     match operation {
         CredsOp::Set { username, stdin } => {
             let username = username.unwrap_or(prompt_username()?);
             let password = prompt_password(stdin)?;
-            keyring::store(&username, &password).await?;
+            let path = config::config_path()?;
+            let mut config = if path.exists() {
+                config::load()?
+            } else {
+                config::Config::default()
+            };
+            config.username = Some(username.clone());
+            config::save(&config)?;
+            keyring::store(&password).await?;
             settings::request_reload();
-            println!("credentials stored for {username}");
+            println!("username saved to {}", path.display());
+            println!("password stored in the system keyring for {username}");
         }
         CredsOp::Get => match keyring::load().await {
-            Ok((username, _)) => println!("credentials present for {username}"),
-            Err(error) if keyring::is_not_found(&error) => println!("no credentials in keyring"),
+            Ok(_) => println!("password present in keyring"),
+            Err(error) if keyring::is_not_found(&error) => println!("no password in keyring"),
             Err(error) => return Err(error),
         },
         CredsOp::Delete => {
             keyring::delete().await?;
             settings::request_reload();
-            println!("credentials deleted");
+            println!("password deleted from keyring (username remains in config)");
         }
     }
     Ok(())
@@ -350,7 +411,7 @@ async fn cmd_config(operation: ConfigOp) -> Result<()> {
         ConfigOp::Init => {
             let path = config::init()?;
             println!("created {}", path.display());
-            println!("add the portal SSIDs you explicitly trust before starting the daemon");
+            println!("run `wifilogin creds set <username>` to finish setup without editing it");
         }
         ConfigOp::Show => println!("{}", toml::to_string_pretty(&config::load()?)?),
         ConfigOp::Edit => {

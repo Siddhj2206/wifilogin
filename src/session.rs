@@ -181,7 +181,7 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                     Snapshot::on_network(
                         State::OtherNetwork,
                         ssid.into(),
-                        "not an allowed NetworkManager connection",
+                        "not an allowed target Wi-Fi network",
                     ),
                     None,
                 )
@@ -276,17 +276,31 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
             }
         }
 
-        let (username, password) = match self.creds.load().await {
-            Ok(credentials) => {
+        let username = match config.username.as_deref() {
+            Some(username) => username,
+            None => {
+                return (
+                    Snapshot::on_network(
+                        State::CredentialsMissing,
+                        ssid,
+                        "username missing — run `wifilogin setup` or `wifilogin creds set <username>`",
+                    )
+                    .with_error("username missing"),
+                    None,
+                );
+            }
+        };
+        let password = match self.creds.load().await {
+            Ok(password) => {
                 self.keyring_resync_pending = false;
-                credentials
+                password
             }
             Err(error) if keyring::is_not_found(&error) => {
                 return (
                     Snapshot::on_network(
                         State::CredentialsMissing,
                         ssid,
-                        "credentials missing — run `wifilogin creds set <username>`",
+                        "password missing — run `wifilogin setup` or `wifilogin creds set <username>`",
                     )
                     .with_error("credentials missing"),
                     None,
@@ -309,7 +323,7 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
 
         let login = match self
             .portal
-            .login(&config.portal_url, &username, &password)
+            .login(&config.portal_url, username, &password)
             .await
         {
             Ok(login) => login,
@@ -439,8 +453,8 @@ mod tests {
     struct FakeCreds;
 
     impl Creds for FakeCreds {
-        async fn load(&self) -> Result<(String, String)> {
-            Ok(("user".into(), "password".into()))
+        async fn load(&self) -> Result<String> {
+            Ok("password".into())
         }
     }
 
@@ -458,10 +472,8 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            targets: vec![crate::config::Target {
-                ssid: "Campus".into(),
-                connection_uuid: "d9428888-122b-11e1-b85c-61cd3cbb3210".into(),
-            }],
+            targets: vec!["Campus".into()],
+            username: Some("user".into()),
             ..Config::default()
         }
     }
@@ -526,7 +538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requires_the_configured_networkmanager_profile() {
+    async fn allows_any_local_profile_for_a_target_ssid() {
         let (mut controller, login_count) = controller(
             Ok(network(
                 "Campus",
@@ -539,7 +551,30 @@ mod tests {
             Outcome::Granted,
         );
         let (snapshot, _) = controller.step(&config()).await;
-        assert_eq!(snapshot.state, State::OtherNetwork);
+        assert_eq!(snapshot.state, State::Online);
+        assert_eq!(login_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn requires_a_configured_username_before_loading_the_password() {
+        let (mut controller, login_count) = controller(
+            Ok(network(
+                "Campus",
+                "d9428888-122b-11e1-b85c-61cd3cbb3210",
+                true,
+                true,
+                Connectivity::Portal,
+            )),
+            true,
+            Outcome::Granted,
+        );
+        let mut config = config();
+        config.username = None;
+
+        let (snapshot, retry) = controller.step(&config).await;
+
+        assert_eq!(snapshot.state, State::CredentialsMissing);
+        assert_eq!(retry, None);
         assert_eq!(login_count.load(Ordering::SeqCst), 0);
     }
 

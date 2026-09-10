@@ -23,8 +23,7 @@ The daemon's policy is intentionally narrow:
 
 ```text
 automatic credential submission
-    = configured local profile UUID
-    + exact SSID
+    = configured target SSID
     + active connection
     + an IPv4 or IPv6 default route
     + NetworkManager reports Portal
@@ -40,7 +39,7 @@ portal form submission.
 
 | Condition | Result | Coverage |
 | --- | --- | --- |
-| First run with no config | `run` exits with an actionable `config init` error; no file is created implicitly. | Safe |
+| First run with no config | `run` exits with an actionable `setup` error; no file is created implicitly. | Safe |
 | Empty target list | Daemon remains in `NoTargets`; it cannot send credentials. | Safe |
 | Unknown/obsolete or malformed TOML field | Configuration is rejected by `deny_unknown_fields`; the running daemon keeps its last valid config on reload. | Safe |
 | Invalid portal or check URL | Validation rejects non-HTTP(S), hostless, and unparsable URLs before the daemon starts. | Safe |
@@ -50,26 +49,26 @@ portal form submission.
 | Wi-Fi adapter absent, unmanaged, disabled, airplane mode, or no AP | `Disconnected`; no scan or activation request is made. | Safe |
 | Wi-Fi device is hot-plugged/removed | `DeviceAdded`/`DeviceRemoved` and device state signals trigger a fresh device list. | Safe |
 | Several Wi-Fi adapters | Every Wi-Fi device is examined; an active one owning a default route wins. Otherwise one active Wi-Fi connection is reported without action. | Safe |
-| Target profile is still activating/deactivating | `Connecting`; no credentials are loaded or sent. | Safe |
+| Target Wi-Fi is still activating/deactivating | `Connecting`; no credentials are loaded or sent. | Safe |
 | Connected to a phone hotspot or any unlisted Wi-Fi | `OtherNetwork`; no portal request. | Safe |
-| Same SSID but a different local NetworkManager profile UUID | `OtherNetwork`; no portal request. | Safe |
+| Another local profile with a target SSID | It is allowed; targets intentionally name VIT Wi-Fi networks rather than machine-local profiles. | Deliberate simplification |
 | Target Wi-Fi is secondary to Ethernet, a full-tunnel VPN, or another default route | `TargetNotDefault`; no portal request. | Safe |
 | Target owns only the IPv6 default route | `Default6` is accepted, so it can qualify just like an IPv4 default route. | Safe |
 | NetworkManager reports `Full` | `Online`; no HTTP connectivity probe is made. | Safe |
 | NetworkManager reports `Portal` | Credentials are submitted using the configured Pronto form, then one HTTP 204 postcondition check runs. | Expected operation |
 | NetworkManager reports `Unknown`, `None`, or `Limited` | `WaitingForNetworkManager`; it does not guess that a portal exists. | Safe, manual action may be needed |
 | Connectivity checks disabled in NetworkManager | State stays `Unknown`; automatic login is intentionally disabled. | Deliberate limitation |
-| Credentials absent | `CredentialsMissing`; no timer retries and no password prompt occurs in the daemon. A `creds set` command wakes it. | Safe |
+| Username or password absent | `CredentialsMissing`; no timer retries and no password prompt occurs in the daemon. `setup` or `creds set` wakes it. | Safe |
 | Credentials definitively rejected | `BadCredentials`; no automatic retry prevents account lockouts. | Safe |
 | Keyring temporarily locked/unavailable | One 750 ms local retry is attempted, then the daemon waits for a control or network event. | Safe recovery |
 | DNS, TLS, portal timeout, or inconclusive portal result | Retries begin at 30 seconds and cap at 5 minutes; each retry re-checks the active profile and route first. | Bounded recovery |
 | User switches to hotspot, Ethernet, VPN, or disconnects during an HTTP request | A D-Bus/control event cancels the in-flight state step; the next step reads current state before any new request. | Safe recovery |
 | Portal response is oversized or chunked indefinitely | Body reading stops above 1 MiB and follows bounded retry behavior. | Safe |
 | Clock changes | Timers use Tokio `Instant`, not wall time. Status timestamps may be cosmetically skewed only. | Safe |
-| Pause/resume, credential changes, config edit | Persistent state is changed first, then a local Unix datagram asks the daemon to reload. | Safe |
+| Pause/resume, setup, credential changes, config edit | Persistent state is changed first, then a local Unix datagram asks the daemon to reload. | Safe |
 | Manual config-file edit | Not watched by design; use `wifilogin config edit` or restart the user service. | Deliberate feature cut |
 | Second daemon launch / stale control socket | A responding socket rejects the second daemon; an unresponsive stale socket is removed before binding. | Safe recovery |
-| `wifilogin login` on a hotspot or Ethernet | The explicit command still requires an allowed, active, default-route profile; it refuses otherwise. | Safe |
+| `wifilogin login` on a hotspot or Ethernet | The explicit command still requires an allowed target SSID, active Wi-Fi, and the default route; it refuses otherwise. | Safe |
 | `wifilogin online` on any network | Performs the requested one-off HTTP check. This command is intentionally diagnostic and does not submit credentials. | Expected operation |
 
 ## Known limits and operator decisions
@@ -80,11 +79,10 @@ small interface.
 1. **Only Pronto login forms are supported.** The form field names and success
    markers are hard-coded. A different captive-portal vendor requires a
    portal adapter, not a looser generic form configuration.
-2. **The profile UUID is local authorization, not access-point
-   authentication.** On an open network, a rogue access point with the same
-   SSID can still be selected by a local NetworkManager profile. Use WPA2/WPA3
-   or Enterprise authentication and, where appropriate, constrain the
-   NetworkManager profile to a BSSID.
+2. **An SSID allowlist is not access-point authentication.** On an open
+   network, a rogue access point can use the same SSID as a target. Use
+   WPA2/WPA3 or Enterprise authentication and, where appropriate, constrain
+   the NetworkManager profile to a BSSID.
 3. **Plain HTTP portal endpoints expose portal credentials to the network.**
    This is a property of portals that require HTTP. Prefer an HTTPS endpoint
    when the portal supports it.
@@ -100,7 +98,7 @@ small interface.
 
 ## Validation performed
 
-- Unit tests cover profile identity, hotspot exclusion, active/default-route
+- Unit tests cover target identity, hotspot exclusion, active/default-route
   gates, unknown connectivity, key credential outcomes, bounded portal retry,
   and one D-Bus resync.
 - Live validation on the development host successfully read an active Wi-Fi
