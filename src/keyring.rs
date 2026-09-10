@@ -2,7 +2,6 @@ use anyhow::Result;
 
 const SERVICE: &str = "wifilogin";
 const PASS_KEY: &str = "password";
-const LEGACY_USER_KEY: &str = "username";
 
 #[derive(Debug)]
 pub struct NotFound;
@@ -79,22 +78,6 @@ fn map_not_found(e: keyring::Error) -> anyhow::Error {
     match e {
         keyring::Error::NoEntry => NotFound.into(),
         other => anyhow::anyhow!(other),
-    }
-}
-
-pub async fn delete() -> Result<()> {
-    on_keyring_thread(|| {
-        delete_entry(PASS_KEY)?;
-        delete_entry(LEGACY_USER_KEY)?;
-        Ok(())
-    })
-    .await
-}
-
-fn delete_entry(key: &str) -> Result<()> {
-    match keyring::Entry::new(SERVICE, key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(error.into()),
     }
 }
 

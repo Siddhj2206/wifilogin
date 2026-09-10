@@ -6,6 +6,11 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BODY: usize = 1024 * 1024;
 const USER_AGENT: &str = concat!("wifilogin/", env!("CARGO_PKG_VERSION"));
 
+/// VIT's Pronto Networks login endpoint.
+const PORTAL_URL: &str = "http://phc.prontonetworks.com/cgi-bin/authlogin?URI=";
+/// Requested once after login to verify that the portal released access.
+const CONNECTIVITY_URL: &str = "http://clients3.google.com/generate_204";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Granted,
@@ -34,8 +39,8 @@ pub struct LoginResult {
 /// Portal + connectivity checks. A seam so the session controller can be
 /// tested without network access.
 pub trait Portal: Send + Sync {
-    async fn online(&self, connectivity_url: &str) -> Result<bool>;
-    async fn login(&self, portal_url: &str, username: &str, password: &str) -> Result<LoginResult>;
+    async fn online(&self) -> Result<bool>;
+    async fn login(&self, username: &str, password: &str) -> Result<LoginResult>;
 }
 
 pub struct PortalClient;
@@ -43,14 +48,14 @@ pub struct PortalClient;
 impl Portal for PortalClient {
     /// True if internet is reachable (HTTP 204). Captive portals intercept the
     /// request, so a non-204 (or a redirect) means we need to log in.
-    async fn online(&self, connectivity_url: &str) -> Result<bool> {
+    async fn online(&self) -> Result<bool> {
         let client = reqwest::Client::builder()
             .timeout(CHECK_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         let resp = client
-            .get(connectivity_url)
+            .get(CONNECTIVITY_URL)
             .header("User-Agent", USER_AGENT)
             .send()
             .await
@@ -60,14 +65,8 @@ impl Portal for PortalClient {
     }
 
     /// POST to the Pronto Networks portal.
-    async fn login(&self, portal_url: &str, username: &str, password: &str) -> Result<LoginResult> {
-        if portal_url.is_empty() {
-            anyhow::bail!("portal_url is required");
-        }
-        let client = reqwest::Client::builder()
-            .timeout(LOGIN_TIMEOUT)
-            .cookie_store(true)
-            .build()?;
+    async fn login(&self, username: &str, password: &str) -> Result<LoginResult> {
+        let client = reqwest::Client::builder().timeout(LOGIN_TIMEOUT).build()?;
 
         let params = [
             ("userId", username),
@@ -77,10 +76,10 @@ impl Portal for PortalClient {
         ];
 
         let mut resp = client
-            .post(portal_url)
+            .post(PORTAL_URL)
             .form(&params)
             .header("User-Agent", USER_AGENT)
-            .header("Referer", portal_url)
+            .header("Referer", PORTAL_URL)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("post login form: {e}"))?;

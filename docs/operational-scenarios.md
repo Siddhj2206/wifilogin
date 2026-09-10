@@ -27,7 +27,6 @@ automatic credential submission
     + active connection
     + an IPv4 or IPv6 default route
     + NetworkManager reports Portal
-    + unpaused daemon
     + readable credentials
 ```
 
@@ -41,8 +40,7 @@ portal form submission.
 | --- | --- | --- |
 | First run with no config | `run` exits with an actionable `setup` error; no file is created implicitly. | Safe |
 | Empty target list | Daemon remains in `NoTargets`; it cannot send credentials. | Safe |
-| Unknown/obsolete or malformed TOML field | Configuration is rejected by `deny_unknown_fields`; the running daemon keeps its last valid config on reload. | Safe |
-| Invalid portal or check URL | Validation rejects non-HTTP(S), hostless, and unparsable URLs before the daemon starts. | Safe |
+| Unknown or malformed TOML field | Configuration is rejected by `deny_unknown_fields` before the daemon starts. | Safe |
 | No NetworkManager/system D-Bus | Startup fails; a systemd unit restarts according to its restart policy. | Safe, unavailable |
 | NetworkManager restarts while running | `NameOwnerChanged` wakes the daemon. A transient property-read error gets one 750 ms resync; later ownership/state signals trigger another fresh read. | Safe recovery |
 | D-Bus connection stream itself errors | The event task closes its receiver, the daemon exits, and systemd restarts it rather than leaving a dead watcher. | Safe recovery |
@@ -58,27 +56,25 @@ portal form submission.
 | NetworkManager reports `Portal` | Credentials are submitted using the configured Pronto form, then one HTTP 204 postcondition check runs. | Expected operation |
 | NetworkManager reports `Unknown`, `None`, or `Limited` | `WaitingForNetworkManager`; it does not guess that a portal exists. | Safe, manual action may be needed |
 | Connectivity checks disabled in NetworkManager | State stays `Unknown`; automatic login is intentionally disabled. | Deliberate limitation |
-| Username or password absent | `CredentialsMissing`; no timer retries and no password prompt occurs in the daemon. `setup` or `creds set` wakes it. | Safe |
+| Username or password absent | `CredentialsMissing`; no timer retries and no password prompt occurs in the daemon. Re-run `setup` to correct it. | Safe |
 | Credentials definitively rejected | `BadCredentials`; no automatic retry prevents account lockouts. | Safe |
 | Keyring temporarily locked/unavailable | One 750 ms local retry is attempted, then the daemon waits for a control or network event. | Safe recovery |
 | DNS, TLS, portal timeout, or inconclusive portal result | Retries begin at 30 seconds and cap at 5 minutes; each retry re-checks the active profile and route first. | Bounded recovery |
 | User switches to hotspot, Ethernet, VPN, or disconnects during an HTTP request | A D-Bus/control event cancels the in-flight state step; the next step reads current state before any new request. | Safe recovery |
 | Portal response is oversized or chunked indefinitely | Body reading stops above 1 MiB and follows bounded retry behavior. | Safe |
 | Clock changes | Timers use Tokio `Instant`, not wall time. Status timestamps may be cosmetically skewed only. | Safe |
-| Pause/resume, setup, credential changes, config edit | Persistent state is changed first, then a local Unix datagram asks the daemon to reload. | Safe |
-| Manual config-file edit | Not watched by design; use `wifilogin config edit` or restart the user service. | Deliberate feature cut |
-| Second daemon launch / stale control socket | A responding socket rejects the second daemon; an unresponsive stale socket is removed before binding. | Safe recovery |
+| Target changes | `target add` or `target remove` persists the allowlist and restarts an installed user service. | Expected operation |
 | `wifilogin login` on a hotspot or Ethernet | The explicit command still requires an allowed target SSID, active Wi-Fi, and the default route; it refuses otherwise. | Safe |
-| `wifilogin online` on any network | Performs the requested one-off HTTP check. This command is intentionally diagnostic and does not submit credentials. | Expected operation |
+| `wifilogin login` on an allowed target with unknown connectivity | Explicit login can be used when NetworkManager cannot classify the portal; it still requires the target, active Wi-Fi, and default-route gates. | Expected operation |
 
 ## Known limits and operator decisions
 
 These are not silent failure modes; they are limits kept outside the daemon's
 small interface.
 
-1. **Only Pronto login forms are supported.** The form field names and success
-   markers are hard-coded. A different captive-portal vendor requires a
-   portal adapter, not a looser generic form configuration.
+1. **Only the VIT Pronto login form is supported.** The form field names,
+   success markers, and portal endpoint are hard-coded. A different vendor is
+   outside this tool's scope.
 2. **An SSID allowlist is not access-point authentication.** On an open
    network, a rogue access point can use the same SSID as a target. Use
    WPA2/WPA3 or Enterprise authentication and, where appropriate, constrain
@@ -92,9 +88,9 @@ small interface.
    false negatives (wait) over credential submission when its target does not
    own either default route.
 5. **A permanently unavailable D-Bus or keyring needs an external recovery.**
-   The user service retries after process failure; a persistent unlocked-keyring
-   issue requires unlocking the keyring or sending a reload. The daemon does
-   not poll either subsystem indefinitely.
+   The user service retries after process failure; a persistent
+   unlocked-keyring issue requires unlocking the keyring and restarting the
+   service. The daemon does not poll either subsystem indefinitely.
 
 ## Validation performed
 

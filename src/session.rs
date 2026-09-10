@@ -1,7 +1,6 @@
 use crate::config::{Config, PortalPermission};
 use crate::keyring::{self, Creds};
 use crate::portal::{Outcome, Portal};
-use crate::settings;
 use crate::wifi::{Connectivity, Wifi};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -12,7 +11,6 @@ const SNAPSHOT_RESYNC_DELAY: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Paused,
     NoTargets,
     Disconnected,
     OtherNetwork,
@@ -36,7 +34,6 @@ impl std::fmt::Display for State {
 pub struct Snapshot {
     pub state: State,
     pub message: String,
-    pub current_ssid: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -45,16 +42,14 @@ impl Snapshot {
         Self {
             state,
             message: message.into(),
-            current_ssid: None,
             last_error: None,
         }
     }
 
-    fn on_network(state: State, ssid: String, message: impl Into<String>) -> Self {
+    fn on_network(state: State, message: impl Into<String>) -> Self {
         Self {
             state,
             message: message.into(),
-            current_ssid: Some(ssid),
             last_error: None,
         }
     }
@@ -62,10 +57,6 @@ impl Snapshot {
     fn with_error(mut self, error: impl Into<String>) -> Self {
         self.last_error = Some(error.into());
         self
-    }
-
-    pub fn is_online(&self) -> bool {
-        self.state == State::Online
     }
 }
 
@@ -107,7 +98,6 @@ pub struct Controller<W: Wifi, P: Portal, C: Creds> {
     wifi: W,
     portal: P,
     creds: C,
-    settings: settings::Manager,
     portal_backoff: Backoff,
     portal_retry: Option<PortalRetry>,
     resync_pending: bool,
@@ -115,12 +105,11 @@ pub struct Controller<W: Wifi, P: Portal, C: Creds> {
 }
 
 impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
-    pub fn new(wifi: W, portal: P, creds: C, settings: settings::Manager) -> Self {
+    pub fn new(wifi: W, portal: P, creds: C) -> Self {
         Self {
             wifi,
             portal,
             creds,
-            settings,
             portal_backoff: Backoff { attempts: 0 },
             portal_retry: None,
             resync_pending: false,
@@ -129,12 +118,6 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
     }
 
     pub async fn step(&mut self, config: &Config) -> (Snapshot, Option<Duration>) {
-        if !self.settings.get().enabled {
-            return (
-                Snapshot::idle(State::Paused, "paused — run `wifilogin resume`"),
-                None,
-            );
-        }
         if config.targets.is_empty() {
             return (
                 Snapshot::idle(
@@ -175,51 +158,44 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                     None,
                 )
             }
-            PortalPermission::OtherNetwork(ssid) => {
+            PortalPermission::OtherNetwork(_) => {
                 self.reset_portal_backoff();
                 (
                     Snapshot::on_network(
                         State::OtherNetwork,
-                        ssid.into(),
                         "not an allowed target Wi-Fi network",
                     ),
                     None,
                 )
             }
-            PortalPermission::Connecting(ssid) => {
+            PortalPermission::Connecting(_) => {
                 self.reset_portal_backoff();
                 (
                     Snapshot::on_network(
                         State::Connecting,
-                        ssid.into(),
                         "target Wi-Fi is changing state — waiting for NetworkManager",
                     ),
                     None,
                 )
             }
-            PortalPermission::TargetNotDefault(ssid) => {
+            PortalPermission::TargetNotDefault(_) => {
                 self.reset_portal_backoff();
                 (
                     Snapshot::on_network(
                         State::TargetNotDefault,
-                        ssid.into(),
                         "target Wi-Fi is not the default route — not submitting credentials",
                     ),
                     None,
                 )
             }
             PortalPermission::Allowed {
-                ssid,
+                ssid: _,
                 connectivity: Connectivity::Full,
                 ..
             } => {
                 self.reset_portal_backoff();
                 (
-                    Snapshot::on_network(
-                        State::Online,
-                        ssid.into(),
-                        "NetworkManager reports full connectivity",
-                    ),
+                    Snapshot::on_network(State::Online, "NetworkManager reports full connectivity"),
                     None,
                 )
             }
@@ -230,13 +206,14 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                 ..
             } => self.login(config, ssid.into(), connection_uuid).await,
             PortalPermission::Allowed {
-                ssid, connectivity, ..
+                ssid: _,
+                connectivity,
+                ..
             } => {
                 self.reset_portal_backoff();
                 (
                     Snapshot::on_network(
                         State::WaitingForNetworkManager,
-                        ssid.into(),
                         format!("NetworkManager connectivity is {connectivity:?} — waiting"),
                     ),
                     None,
@@ -259,7 +236,6 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                     return (
                         Snapshot::on_network(
                             State::Captive,
-                            ssid,
                             format!(
                                 "{} — retrying in {}",
                                 retry.message,
@@ -282,8 +258,7 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                 return (
                     Snapshot::on_network(
                         State::CredentialsMissing,
-                        ssid,
-                        "username missing — run `wifilogin setup` or `wifilogin creds set <username>`",
+                        "username missing — run `wifilogin setup`",
                     )
                     .with_error("username missing"),
                     None,
@@ -299,8 +274,7 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                 return (
                     Snapshot::on_network(
                         State::CredentialsMissing,
-                        ssid,
-                        "password missing — run `wifilogin setup` or `wifilogin creds set <username>`",
+                        "password missing — run `wifilogin setup`",
                     )
                     .with_error("credentials missing"),
                     None,
@@ -312,7 +286,6 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
                 return (
                     Snapshot::on_network(
                         State::Error,
-                        ssid,
                         format!("could not load credentials: {error}"),
                     )
                     .with_error(error.to_string()),
@@ -321,11 +294,7 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
             }
         };
 
-        let login = match self
-            .portal
-            .login(&config.portal_url, username, &password)
-            .await
-        {
+        let login = match self.portal.login(username, &password).await {
             Ok(login) => login,
             Err(error) => {
                 return self.retry(
@@ -340,19 +309,18 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
             return (
                 Snapshot::on_network(
                     State::BadCredentials,
-                    ssid,
-                    "invalid portal credentials — update with `wifilogin creds set`",
+                    "invalid portal credentials — re-run `wifilogin setup`",
                 )
                 .with_error("invalid credentials"),
                 None,
             );
         }
 
-        match self.portal.online(&config.connectivity_url).await {
+        match self.portal.online().await {
             Ok(true) => {
                 self.reset_portal_backoff();
                 (
-                    Snapshot::on_network(State::Online, ssid, "portal login verified"),
+                    Snapshot::on_network(State::Online, "portal login verified"),
                     None,
                 )
             }
@@ -385,7 +353,6 @@ impl<W: Wifi, P: Portal, C: Creds> Controller<W, P, C> {
         (
             Snapshot::on_network(
                 State::Captive,
-                ssid,
                 format!("{message} — retrying in {}", format_duration(delay)),
             )
             .with_error(message),
@@ -432,13 +399,12 @@ mod tests {
     }
 
     impl Portal for FakePortal {
-        async fn online(&self, _url: &str) -> Result<bool> {
+        async fn online(&self) -> Result<bool> {
             Ok(self.online.load(Ordering::SeqCst))
         }
 
         async fn login(
             &self,
-            _url: &str,
             _username: &str,
             _password: &str,
         ) -> Result<crate::portal::LoginResult> {
@@ -458,23 +424,10 @@ mod tests {
         }
     }
 
-    fn settings() -> settings::Manager {
-        let path = std::env::temp_dir().join(format!(
-            "wifilogin-session-test-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        settings::Manager::from_path(path).unwrap()
-    }
-
     fn config() -> Config {
         Config {
             targets: vec!["Campus".into()],
             username: Some("user".into()),
-            ..Config::default()
         }
     }
 
@@ -512,7 +465,6 @@ mod tests {
                     login_count: login_count.clone(),
                 },
                 FakeCreds,
-                settings(),
             ),
             login_count,
         )

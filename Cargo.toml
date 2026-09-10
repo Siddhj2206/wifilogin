@@ -11,14 +11,13 @@ zbus = { version = "5", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "cookies", "form"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "form"] }
 keyring = "4"
 anyhow = "1"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
-serde_json = "1"
 rpassword = "7"
 
 [profile.release]

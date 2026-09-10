@@ -1,9 +1,8 @@
 //! Manage the systemd user service.
 //!
-//! The unit file is embedded in the binary at compile time (so `cargo install
-//! --git` needs nothing from the repo on disk) and rendered with the path of
-//! the *currently running* executable, so the service always points at
-//! whatever binary ran `service install`.
+//! The unit file is embedded in the binary at compile time and rendered with
+//! the path of the *currently running* executable, so `setup` always points at
+//! the binary that performed setup.
 
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -14,21 +13,13 @@ const UNIT_TEMPLATE: &str = include_str!("../systemd/wifilogin.service.in");
 
 /// Where the rendered unit lives for the current user.
 pub fn unit_path() -> Result<PathBuf> {
-    let dir = crate::config::user_config_dir()?;
+    let dir = crate::paths::config_dir()?;
     Ok(dir.join("systemd/user").join(UNIT_NAME))
 }
 
-/// Render the unit for a given executable path. `extra_env` holds
-/// `KEY=VALUE` strings that get baked in as `Environment=` lines (e.g. a
-/// `WIFILOGIN_CONFIG` override set at install time).
-pub fn render_unit(exe: &str, extra_env: &[String]) -> String {
-    let env_lines: String = extra_env
-        .iter()
-        .map(|kv| format!("Environment={kv}\n"))
-        .collect();
-    UNIT_TEMPLATE
-        .replace("@EXE@", exe)
-        .replace("@EXTRA_ENV@", &env_lines)
+/// Render the unit for a given executable path.
+pub fn render_unit(exe: &str) -> String {
+    UNIT_TEMPLATE.replace("@EXE@", exe)
 }
 
 fn require_systemctl() -> Result<()> {
@@ -36,14 +27,6 @@ fn require_systemctl() -> Result<()> {
         bail!("systemctl not found — `service` commands require a systemd user session");
     }
     Ok(())
-}
-
-fn require_installed() -> Result<PathBuf> {
-    let path = unit_path()?;
-    if !path.exists() {
-        bail!("service not installed — run `wifilogin service install` first");
-    }
-    Ok(path)
 }
 
 fn systemctl_raw(args: &[&str]) -> Result<std::process::Output> {
@@ -74,19 +57,12 @@ pub fn install() -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable path")?;
     let exe = exe.display().to_string();
 
-    // Persist env overrides the user runs install with — the systemd
-    // environment won't have them otherwise.
-    let mut extra_env = Vec::new();
-    if let Ok(v) = std::env::var("WIFILOGIN_CONFIG") {
-        extra_env.push(format!("WIFILOGIN_CONFIG={v}"));
-    }
-
     let path = unit_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
 
-    let contents = render_unit(&exe, &extra_env);
+    let contents = render_unit(&exe);
     let existed = path.exists();
     let changed = std::fs::read_to_string(&path).ok().as_deref() != Some(contents.as_str());
     if changed {
@@ -133,43 +109,17 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-pub fn start() -> Result<()> {
+/// Apply target changes immediately when wifilogin is service-managed.
+pub fn restart_if_installed() -> Result<()> {
+    let path = unit_path()?;
+    if !path.exists() {
+        println!("service not installed; targets will apply when `wifilogin setup` installs it");
+        return Ok(());
+    }
     require_systemctl()?;
-    require_installed()?;
-    systemctl(&["start", UNIT_NAME])?;
-    println!("started {UNIT_NAME}");
-    Ok(())
-}
-
-pub fn stop() -> Result<()> {
-    require_systemctl()?;
-    require_installed()?;
-    systemctl(&["stop", UNIT_NAME])?;
-    println!("stopped {UNIT_NAME}");
-    Ok(())
-}
-
-pub fn restart() -> Result<()> {
-    require_systemctl()?;
-    require_installed()?;
     systemctl(&["restart", UNIT_NAME])?;
     println!("restarted {UNIT_NAME}");
     Ok(())
-}
-
-/// Passthrough to `systemctl --user status` — exit code propagates
-/// (0 active, 3 inactive, non-zero other failures).
-pub fn status() -> Result<()> {
-    require_systemctl()?;
-    require_installed()?;
-    let code = Command::new("systemctl")
-        .arg("--user")
-        .arg("status")
-        .arg(UNIT_NAME)
-        .status()?
-        .code()
-        .unwrap_or(1);
-    std::process::exit(code);
 }
 
 #[cfg(test)]
@@ -177,20 +127,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_exe_and_env() {
-        let u = render_unit(
-            "/home/sid/.cargo/bin/wifilogin",
-            &["WIFILOGIN_CONFIG=/tmp/cfg.toml".to_string()],
-        );
+    fn renders_exe() {
+        let u = render_unit("/home/sid/.cargo/bin/wifilogin");
         assert!(u.contains("ExecStart=/home/sid/.cargo/bin/wifilogin run"));
-        assert!(u.contains("Environment=WIFILOGIN_CONFIG=/tmp/cfg.toml"));
         assert!(!u.contains("@EXE@"));
-        assert!(!u.contains("@EXTRA_ENV@"));
     }
 
     #[test]
-    fn renders_without_extra_env() {
-        let u = render_unit("/usr/local/bin/wifilogin", &[]);
+    fn renders_without_unresolved_placeholders() {
+        let u = render_unit("/usr/local/bin/wifilogin");
         assert!(u.contains("ExecStart=/usr/local/bin/wifilogin run"));
         // The placeholder line is gone entirely, leaving no stray blank issues
         assert!(!u.contains("@"));
