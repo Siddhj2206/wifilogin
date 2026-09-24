@@ -57,7 +57,7 @@ pub async fn store(password: &str) -> Result<()> {
     }
     let p = password.to_string();
     on_keyring_thread(move || {
-        let pass_entry = keyring::Entry::new(SERVICE, PASS_KEY)?;
+        let pass_entry = open_entry(SERVICE)?;
         pass_entry.set_password(&p)?;
         Ok(())
     })
@@ -69,9 +69,24 @@ pub async fn load() -> Result<String> {
 }
 
 fn try_load(service: &str) -> Result<String> {
-    let pass_entry = keyring::Entry::new(service, PASS_KEY)?;
+    let pass_entry = open_entry(service)?;
     let p = pass_entry.get_password().map_err(map_not_found)?;
     Ok(p)
+}
+
+/// Open a keyring entry, replacing keyring v4's opaque `NoDefaultStore` error
+/// ("No default store has been set...") with a short, actionable one when no
+/// credential store is reachable.
+fn open_entry(service: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(service, PASS_KEY).map_err(|error| {
+        if keyring::Entry::store_status().is_err() {
+            anyhow::anyhow!(
+                "system credential store unavailable (no Secret Service provider on D-Bus)"
+            )
+        } else {
+            anyhow::anyhow!(error)
+        }
+    })
 }
 
 fn map_not_found(e: keyring::Error) -> anyhow::Error {
