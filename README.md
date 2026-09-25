@@ -76,5 +76,6 @@ socket runs in the background.
 - Linux with NetworkManager on the system D-Bus
 - NetworkManager connectivity checking enabled; if it reports `Unknown`, it
   cannot safely determine whether to submit credentials
-- A user session keyring supported by the `keyring` crate
+- A Secret Service provider on the user D-Bus (`oo7-daemon` on Fedora 45+, or
+  `gnome-keyring`)
 - Optional: systemd user services for automatic background login

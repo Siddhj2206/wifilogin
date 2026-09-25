@@ -12,7 +12,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "form"] }
-keyring = "4"
+keyring-core = "1"
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 anyhow = "1"
 libc = "0.2"
 tracing = "0.1"

@@ -89,9 +89,10 @@ small interface.
    false negatives (wait) over credential submission when its target does not
    own either default route.
 5. **A permanently unavailable D-Bus or keyring needs an external recovery.**
-   The user service retries after process failure; a persistent
-   unlocked-keyring issue requires unlocking the keyring and restarting the
-   service. The daemon does not poll either subsystem indefinitely.
+   Transient Secret Service outages (for example while `oo7-daemon` restarts)
+   clear on the next keyring read; a persistent locked-keyring issue still
+   requires unlocking the keyring and restarting the service. The daemon does
+   not poll either subsystem indefinitely.
 
 ## Validation performed
 

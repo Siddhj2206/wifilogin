@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use keyring_core::api::CredentialStoreApi as _;
 
 const SERVICE: &str = "wifilogin";
 const PASS_KEY: &str = "password";
@@ -74,24 +75,26 @@ fn try_load(service: &str) -> Result<String> {
     Ok(p)
 }
 
-/// Open a keyring entry, replacing keyring v4's opaque `NoDefaultStore` error
-/// ("No default store has been set...") with a short, actionable one when no
-/// credential store is reachable.
-fn open_entry(service: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(service, PASS_KEY).map_err(|error| {
-        if keyring::Entry::store_status().is_err() {
-            anyhow::anyhow!(
-                "system credential store unavailable (no Secret Service provider on D-Bus)"
-            )
-        } else {
-            anyhow::anyhow!(error)
-        }
-    })
+/// Open an entry against a freshly created Secret Service store.
+///
+/// The `keyring` v4 facade initializes its platform store once per process and
+/// caches the result forever, so a boot race with the Secret Service daemon
+/// (e.g. Fedora 45's `oo7-daemon` not yet owning `org.freedesktop.secrets`)
+/// permanently wedges that process: every later `Entry::new` returns
+/// `NoDefaultStore`. Building a new store per operation keeps a failed read
+/// recoverable, so the daemon's next retry can succeed after the store comes up
+/// or restarts.
+fn open_entry(service: &str) -> Result<keyring_core::Entry> {
+    let store = zbus_secret_service_keyring_store::Store::new()
+        .context("system credential store unavailable (Secret Service)")?;
+    store
+        .build(service, PASS_KEY, None)
+        .with_context(|| format!("open keyring entry for service '{service}'"))
 }
 
-fn map_not_found(e: keyring::Error) -> anyhow::Error {
+fn map_not_found(e: keyring_core::Error) -> anyhow::Error {
     match e {
-        keyring::Error::NoEntry => NotFound.into(),
+        keyring_core::Error::NoEntry => NotFound.into(),
         other => anyhow::anyhow!(other),
     }
 }
